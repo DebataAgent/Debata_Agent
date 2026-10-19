@@ -14,6 +14,7 @@ from typing import Any
 
 from utils.token_budget import TokenBudget, TokenEstimator
 
+from .model_view import ModelViewPolicy, ModelViewResult, build_model_view
 from .pipeline_context import _recommended_context_budget
 
 logger = logging.getLogger(__name__)
@@ -49,19 +50,36 @@ class PipelineWorkingContextMixin:
         return TokenEstimator(
             model=getattr(self.chat_agent.cfg, "model", ""),
             calib_ratio=self._token_calib_ratio,
+            provider=getattr(self, "_token_calib_provider", ""),
         )
 
     def _calibrate_tokens(self, estimated: int, actual_prompt_tokens: int) -> None:
         if estimated <= 0 or actual_prompt_tokens <= 0:
             return
-        estimator = self._token_estimator()
-        estimator.update_calibration(estimated, actual_prompt_tokens)
-        self._token_calib_ratio = estimator.calib_ratio
-        logger.debug(
-            "token 估算校准：estimated=%s actual=%s ratio=%.3f",
+        store = getattr(self, "token_calibration", None)
+        if store is not None:
+            state = store.update_sample(
+                getattr(self, "_token_calib_provider", ""),
+                getattr(self, "_token_calib_model", ""),
+                estimated_prompt_tokens=estimated,
+                actual_prompt_tokens=actual_prompt_tokens,
+            )
+            self._token_calib_ratio = state.ratio
+            self._token_calib_samples = state.samples
+            self._token_calib_mape = state.mape
+        else:
+            estimator = self._token_estimator()
+            estimator.update_calibration(estimated, actual_prompt_tokens)
+            self._token_calib_ratio = estimator.calib_ratio
+        # 用 info：这个系数直接决定上下文预算与压缩时机，藏在 debug 里会让
+        # "估算高估 2 倍导致压缩风暴" 这类故障变得不可观测。
+        logger.info(
+            "token 估算校准：estimated=%s actual=%s ratio=%.3f samples=%s mape=%.3f",
             estimated,
             actual_prompt_tokens,
             self._token_calib_ratio,
+            getattr(self, "_token_calib_samples", 0),
+            getattr(self, "_token_calib_mape", 0.0),
         )
 
     def _rolling_summary_text(self, estimator: TokenEstimator | None = None) -> str:
@@ -164,17 +182,59 @@ class PipelineWorkingContextMixin:
 
         return f"{fit_prefix(head_budget)}{marker}{fit_suffix(tail_budget)}"
 
+    def _model_view_policy(self) -> ModelViewPolicy:
+        cfg = getattr(self.behavior_cfg.context, "model_view", None)
+        if cfg is None:
+            return ModelViewPolicy()
+        return ModelViewPolicy(
+            enabled=bool(getattr(cfg, "enabled", True)),
+            task_context_keep=int(getattr(cfg, "task_context_keep", 2)),
+            send_receipt_keep=int(getattr(cfg, "send_receipt_keep", 2)),
+            send_status_keep=int(getattr(cfg, "send_status_keep", 2)),
+            no_action_keep=int(getattr(cfg, "no_action_keep", 4)),
+            max_record_chars=int(getattr(cfg, "max_record_chars", 8000)),
+            project_tool_results=bool(
+                getattr(cfg, "project_tool_results", True)
+            ),
+        )
+
+    async def _active_model_view(
+        self,
+        conversation_id: str | None,
+    ) -> ModelViewResult:
+        records = await self._active_history_records()
+        view = build_model_view(
+            records,
+            policy=self._model_view_policy(),
+            conversation_id=conversation_id,
+        )
+        logger.debug(
+            "模型视图：raw=%s view=%s dropped_runtime=%s dropped_no_action=%s "
+            "capped=%s projected_tools=%s",
+            len(records),
+            len(view.records),
+            view.dropped_runtime,
+            view.dropped_no_action_records,
+            view.capped_records,
+            view.projected_tool_results,
+        )
+        return view
+
     async def _select_working_history(
         self,
         conversation_id: str | None,
     ) -> list[dict[str, Any]]:
-        """返回 rolling summary 游标之后的完整活跃时间线。"""
-        _ = conversation_id
-        return await self._active_history_records()
+        """返回 rolling summary 游标之后、经过模型视图裁剪的活跃时间线。
+
+        只裁剪传给模型的内容；``_active_history_records()`` 仍返回原始记录，
+        供摘要/归档/工具检索使用。
+        """
+        view = await self._active_model_view(conversation_id)
+        return view.records
 
     async def _select_proactive_router_history(self) -> list[dict[str, Any]]:
-        """主动路由专用小窗口；真正行动轮仍使用正常工作窗口。"""
-        records = await self._active_history_records()
+        """主动路由专用小窗口；先裁运行时噪声，再按预算取最近后缀。"""
+        records = await self._select_working_history(None)
         return self._select_recent_records_for_budget(
             records,
             working_budget=min(
@@ -196,15 +256,55 @@ class PipelineWorkingContextMixin:
             return helper(records)
         return max(0, min(self.rolling_summary.active_start_index(), len(records)))
 
+    def _fixed_prompt_overhead_tokens(self) -> int:
+        """估算 system prompt + 工具 schema 的固定开销。
+
+        比静态的 ``prompt_overhead_estimate_tokens`` 更准；失败时回退到配置值。
+        结果按进程缓存，人格/工具集在运行期不变。
+        """
+        cached = getattr(self, "_fixed_prompt_overhead_cache", None)
+        if cached is not None:
+            return int(cached)
+        fallback = int(
+            getattr(self.behavior_cfg.context, "prompt_overhead_estimate_tokens", 12000)
+            or 0
+        )
+        try:
+            from agents.context_builder import build_combined_system_prompt
+
+            system_content = build_combined_system_prompt(
+                self.persona,
+                memory_mode=self.features_cfg.long_term_memory.mode,
+                eat_tool=bool(getattr(self, "eat_tool", False)),
+                sleep_tool=bool(getattr(self, "sleep_tool", False)),
+            )
+            tools = (
+                self.tool_registry.get_schemas()
+                if getattr(self, "tool_registry", None) is not None
+                else None
+            )
+            overhead = self._token_estimator().estimate_prompt(
+                [{"role": "system", "content": system_content}],
+                tools,
+            )
+        except Exception:
+            logger.debug("估算固定 prompt 开销失败，使用配置回退值", exc_info=True)
+            overhead = fallback
+        self._fixed_prompt_overhead_cache = int(overhead)
+        return int(overhead)
+
     def _working_history_budget(self) -> int:
         budget = self._context_budget()
         context_cfg = self.behavior_cfg.context
+        overhead = self._fixed_prompt_overhead_tokens()
+        if overhead <= 0:
+            overhead = context_cfg.prompt_overhead_estimate_tokens
         return max(
             1,
             budget.total_input_budget
             - budget.memory_token_budget
             - budget.summary_token_budget
-            - context_cfg.prompt_overhead_estimate_tokens,
+            - overhead,
         )
 
     def _warn_context_compaction_invariants(self) -> None:
@@ -221,7 +321,8 @@ class PipelineWorkingContextMixin:
                 self._context_budget().max_context_tokens
                 * summarize.trigger_at_context_percent
                 / 100
-            )
+            ) - self._fixed_prompt_overhead_tokens()
+        trigger = max(1, trigger)
         if trigger >= working_budget:
             logger.warning(
                 "滚动摘要触发线高于活跃记录预算：trigger=%s working_budget=%s；"
@@ -237,10 +338,9 @@ class PipelineWorkingContextMixin:
         estimator: TokenEstimator | None = None,
     ) -> int:
         estimator = estimator or self._token_estimator()
-        estimated = estimator.estimate_messages(messages)
-        if tools_schema:
-            estimated += estimator.estimate_text(str(tools_schema))
-        return estimated
+        # 用与 provider 实际发送口径一致的规范 JSON 估算 messages + tools，
+        # 不再用 str(tools_schema)（Python repr 会引入双引号/空格差异）。
+        return estimator.estimate_prompt(messages, tools_schema)
 
     async def _prepare_main_prompt_for_model(
         self,
@@ -336,10 +436,10 @@ class PipelineWorkingContextMixin:
         self,
         estimator: TokenEstimator,
     ) -> int | None:
-        active = await self._active_history_records()
-        if len(active) <= 1:
+        view = await self._active_model_view(None)
+        if len(view.records) <= 1:
             return None
-        active_tokens = estimator.estimate_messages(active)
+        active_tokens = estimator.estimate_messages(view.records)
         return self._summary_target_after_tokens(active_tokens=active_tokens)
 
     async def _retry_budget_target(
@@ -348,17 +448,22 @@ class PipelineWorkingContextMixin:
         *,
         first_target: int | None,
     ) -> int:
-        active = await self._active_history_records()
-        if not active:
+        view = await self._active_model_view(None)
+        if not view.records:
             return 1
-        active_tokens = estimator.estimate_messages(active)
+        active_tokens = estimator.estimate_messages(view.records)
         if active_tokens <= 1:
             return 1
         retry_percent = self.behavior_cfg.summarize.retry_target_after_context_percent
-        retry_target = int(
+        retry_target_total = int(
             self._context_budget().max_context_tokens
             * retry_percent
             / 100
+        )
+        # 压缩目标是“模型可见历史”的 token；固定 system/tools 开销不参与压缩。
+        retry_target = max(
+            1,
+            retry_target_total - self._fixed_prompt_overhead_tokens(),
         )
         retry_target = max(1, min(retry_target, active_tokens - 1))
         if first_target is not None:

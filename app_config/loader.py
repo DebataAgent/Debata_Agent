@@ -36,7 +36,7 @@ _MAX_FUTURE_CONFIG_PRUNE_PASSES = 20
 _FUTURE_PRUNE_VALUE_ERROR_TYPES = frozenset({"enum", "literal_error"})
 
 
-def _user_error_text(e: Exception) -> str:
+def user_error_text(e: Exception) -> str:
     """Pydantic ValidationError → 带字段详情；其它异常 → 原样截断 500 字。"""
     if isinstance(e, ValidationError):
         lines = ["配置校验未通过："]
@@ -262,7 +262,7 @@ def _validate_future_config_subset(raw: dict[str, Any]) -> RootConfig:
             if unsafe_errors or not prunable_errors:
                 raise ConfigError(
                     "未来版本配置无法提取当前兼容子集，存在当前版本不能安全忽略的配置段或校验错误：\n"
-                    + _user_error_text(e)
+                    + user_error_text(e)
                 ) from e
 
             removed_any = False
@@ -279,7 +279,7 @@ def _validate_future_config_subset(raw: dict[str, Any]) -> RootConfig:
             if not removed_any:
                 raise ConfigError(
                     "未来版本配置无法提取当前兼容子集，无法定位可忽略的叶子字段：\n"
-                    + _user_error_text(e)
+                    + user_error_text(e)
                 ) from e
 
     raise ConfigError("未来版本配置无法在有限次数内提取当前兼容子集")
@@ -318,7 +318,7 @@ def load_config(paths: AppPaths, set_global: bool = True) -> RootConfig:
         try:
             cfg = RootConfig.model_validate(migrated_raw)
         except ValidationError as e:
-            raise ConfigError(_user_error_text(e)) from e
+            raise ConfigError(user_error_text(e)) from e
 
     if migration_report.changed and not migration_report.future_version:
         _save_config_data(

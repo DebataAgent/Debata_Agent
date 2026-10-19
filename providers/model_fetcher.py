@@ -7,11 +7,13 @@ anthropic 协议返回已知模型列表（官方无 /models 端点）。
 from __future__ import annotations
 
 import logging
-import os
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
+
+from utils.proxy_env import sanitize_no_proxy_env
 
 from .base import ProviderError
 
@@ -54,19 +56,16 @@ def _should_skip(model_id: str) -> bool:
 
 
 def _client_kwargs(timeout: float) -> dict[str, Any]:
-    kwargs: dict[str, Any] = {
-        "timeout": timeout,
-        "trust_env": True,
-    }
-    proxy = (
-        os.getenv("HTTPS_PROXY")
-        or os.getenv("https_proxy")
-        or os.getenv("HTTP_PROXY")
-        or os.getenv("http_proxy")
-    )
-    if proxy:
-        kwargs["proxy"] = proxy
-    return kwargs
+    """给 httpx 的客户端参数。
+
+    只开 ``trust_env``，**不**显式传 ``proxy=``：显式传参会盖掉 httpx 自己的
+    NO_PROXY 判定，用户写了 ``NO_PROXY=api.example.com`` 也会被硬塞进代理。
+    实测踩过：本机 HTTP(S)_PROXY 指向一个坏代理（TLS 握手 5 秒超时），用户
+    把中转站域名加进 NO_PROXY 想绕开，却在「获取模型列表」时照样超时——
+    因为这里又把代理塞回去了。交给 trust_env，httpx 会按 NO_PROXY 自行分流。
+    """
+    sanitize_no_proxy_env()
+    return {"timeout": timeout, "trust_env": True}
 
 
 async def fetch_model_list(
@@ -90,13 +89,41 @@ async def fetch_model_list(
         ProviderError: 网络错误 / 鉴权失败 / 响应格式异常
     """
     if protocol == "anthropic":
+        # 官方 api.anthropic.com 没有 /models，只能给内置清单。
+        # 但中转站（base_url 指向别处）几乎都提供 OpenAI 风格的 /models，
+        # 且它们挂的模型往往比内置清单新（或名字不同，比如 claude-opus-4-8），
+        # 硬编码清单会让用户看到一堆自己账号里根本不存在的模型。
+        # 所以非官方端点先试远端，失败再退回内置清单。
+        if not _is_official_anthropic(base_url):
+            try:
+                remote = await _fetch_openai_style_models(base_url, api_key, timeout)
+                if remote:
+                    return remote
+            except ProviderError as e:
+                logger.info("中转站 /models 不可用，回落到内置 Claude 清单：%s", e)
         return list(_ANTHROPIC_KNOWN)
 
     if protocol != "openai_compat":
         raise ProviderError(f"协议 {protocol!r} 不支持获取模型列表")
 
+    return await _fetch_openai_style_models(base_url, api_key, timeout)
+
+
+def _is_official_anthropic(base_url: str) -> bool:
+    """判断是不是 Anthropic 官方端点（官方没有 /models，不必白跑一趟）。"""
+    host = base_url.lower()
+    for prefix in ("https://", "http://"):
+        if host.startswith(prefix):
+            host = host[len(prefix):]
+    host = host.split("/", 1)[0].split(":", 1)[0]
+    return host == "api.anthropic.com" or host.endswith(".anthropic.com")
+
+
+async def _fetch_openai_style_models(
+    base_url: str, api_key: str, timeout: float
+) -> list[str]:
+    """按 OpenAI 约定拉 GET {api_root}/models。"""
     # 去掉 /v{N} 后缀得到 API 根路径
-    import re
     api_root = re.sub(r"/v\d+$", "", base_url)
     url = f"{api_root}/models"
 

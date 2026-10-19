@@ -53,6 +53,12 @@ from .persona.helpers import (
     _call_subconscious_starter_fallback as _call_subconscious_starter_fallback,
 )
 from .persona.helpers import (
+    _cap_cues as _cap_cues,
+)
+from .persona.helpers import (
+    _cap_effects as _cap_effects,
+)
+from .persona.helpers import (
     _coerce_cue as _coerce_cue,
 )
 from .persona.helpers import (
@@ -282,7 +288,13 @@ _SHORT_TERM_UPDATE_GUIDANCE = (
     "effects[] 用于会持续一段时间的临时情绪、身体感、语气倾向、行动倾向或关系余韵；"
     "当本轮互动留下明显短期余韵时，应创建或更新 effect，而不是只写进 latest_monologue。"
     "例如被反复关心后的柔软/害羞、晚安后的温暖余韵、被误解后的防备、"
-    "想暂时收尾休息的倾向。已有同类短期影响时优先用真实 id update 或 close；"
+    "想暂时收尾休息的倾向。"
+    "name 必须是**可复用的类别名**（如“柔软余韵”“嘴硬不服”“损友调侃劲”），"
+    "绝不能写成一次性的具体事件描述（如“被某首歌勾起的好奇吐槽劲”）；"
+    "同一类情绪只应存在一条：先按 name / effect_type 查找已有项，用真实 id 更新它的 "
+    "intensity，只有确实出现全新类别时才 create。"
+    "系统对每类短期影响有数量上限，超出会丢弃最旧的，所以不要把每轮琐事都新建一条。"
+    "已有同类短期影响时优先用真实 id update 或 close；"
     "不要把短期余韵塞进长期 profile。\n"
     "cues[] 用于对当前会话或近期互动有用、但不适合进长期画像、也不构成可执行待办的短期线索；"
     "当对方正在引导、某个话题还没完全收束、近期需要接续某个聊天意图时，应创建或更新 cue，"
@@ -409,9 +421,16 @@ class PersonaAgent:
         if state.latest_monologue:
             lines.append(f"- 最近内心独白: {state.latest_monologue}")
 
-        hints = [effect.prompt_hint for effect in self._effects if effect.prompt_hint]
+        # 取**最新**的 5 条：self._effects 是插入序（最旧在前），直接切片会让主模型
+        # 看到最旧、最不相关的情绪残留，当下真正有效的反而被埋掉。
+        recent_effects = sorted(
+            (effect for effect in self._effects if effect.prompt_hint),
+            key=lambda effect: (effect.created_at, effect.id),
+            reverse=True,
+        )
+        hints = [effect.prompt_hint for effect in recent_effects[:5]]
         if hints:
-            lines.append("- 当前短期影响: " + "；".join(hints[:5]))
+            lines.append("- 当前短期影响: " + "；".join(hints))
 
         profile = self._profile_for_conversation(conversation_id)
         if profile is not None:
@@ -891,11 +910,12 @@ class PersonaAgent:
             "只在你能根据时长、动作和当前状态判断时填写。"
             "不确定的字段省略，系统会保留公式兜底结果。\n"
             "latest_monologue 写醒来或吃完后的短句内心状态；不要编造外部事件。\n"
-            f"{retry_text}\n\n"
+            "\n\n"
             f"<action>{action}</action>\n"
-            f"<ended_at>{ended_at}</ended_at>\n"
             f"<finish_updates>{json.dumps(extra_updates, ensure_ascii=False, default=str)}</finish_updates>\n"
-            f"<当前状态>\n{json.dumps(asdict(self._state), ensure_ascii=False)}\n</当前状态>"
+            f"<当前状态>\n{json.dumps(asdict(self._state), ensure_ascii=False)}\n</当前状态>\n"
+            f"<ended_at>{ended_at}</ended_at>\n"
+            f"{retry_text}"
         )
         return [
             {
@@ -923,12 +943,16 @@ class PersonaAgent:
             "todos[] 需要 title，可选 reason/priority/scope/expires_at；已有 todo 可用 id 加 status/completed/done/cancelled 标记完成或取消。"
             "cues[] 需要 summary，可选 cue_type/conversation_id/expires_at。"
             "priority 必须是 0-10 整数；时间必须是 unix timestamp 数字；已有项操作必须带上下文里出现过的真实 id。\n"
-            f"{retry_text}\n\n"
-            f"<now>{now}</now>\n"
-            f"<当前状态>\n{json.dumps(asdict(self._state), ensure_ascii=False)}\n</当前状态>\n"
+            "\n\n"
+            # 数据块按变化频率升序：低频的待办/线索/短期影响在前，每 tick 必变的
+            # 当前状态与 now 在后，retry 提示压最末。前缀缓存只认「完整匹配的 token
+            # 块」，把必变项提前会使其后所有内容失去复用机会。
             f"<待办>\n{json.dumps([asdict(todo) for todo in self._todos], ensure_ascii=False, default=str)}\n</待办>\n"
             f"<线索>\n{json.dumps([asdict(cue) for cue in self._cues], ensure_ascii=False, default=str)}\n</线索>\n"
-            f"<短期影响>\n{json.dumps([asdict(effect) for effect in self._effects], ensure_ascii=False, default=str)}\n</短期影响>"
+            f"<短期影响>\n{json.dumps([asdict(effect) for effect in self._effects], ensure_ascii=False, default=str)}\n</短期影响>\n"
+            f"<当前状态>\n{json.dumps(asdict(self._state), ensure_ascii=False)}\n</当前状态>\n"
+            f"<now>{now}</now>\n"
+            f"{retry_text}"
         )
         return [
             {
@@ -1017,8 +1041,11 @@ class PersonaAgent:
             "这类关系更新不要求同时写长期画像事实；私聊可省略 user_id 由系统推断。\n"
             "todos[] 需要 title，可选 reason/priority/scope/expires_at；已有 todo 可用 id 加 status/completed/done/cancelled 标记完成或取消；priority 必须是 0-10 整数，不要写 low/medium/high。\n"
             "cues[] 需要 summary，可选 cue_type/conversation_id/expires_at。\n"
-            f"{retry_text}\n\n"
+            "\n\n"
+            # 静态指令在前、易变上下文在后；retry 提示压最末，这样重试时
+            # 前半段指令仍与上一次请求逐字节一致，不会因重试把整个前缀打掉。
             f"{context_text}"
+            f"{retry_text}"
         )
         return [
             {
@@ -1159,6 +1186,10 @@ class PersonaAgent:
                     "after": asdict(effect),
                 }
             )
+
+        pruned = await self._enforce_effect_cap_locked()
+        if pruned:
+            applied_changes["effects_pruned"] = pruned
 
         if touch_profile and inferred_user_id:
             before = _profile_snapshot(self._profiles.get(inferred_user_id))
@@ -1360,6 +1391,10 @@ class PersonaAgent:
                     "after": asdict(cue),
                 }
             )
+
+        pruned_cues = await self._enforce_cue_cap_locked()
+        if pruned_cues:
+            applied_changes["cues_pruned"] = pruned_cues
 
         state.mood = clamp_percent(state.mood)
         state.social_need = clamp_percent(state.social_need)
@@ -1871,6 +1906,17 @@ class PersonaAgent:
             effect = _coerce_effect(item)
             if effect is not None:
                 effects.append(effect)
+        # 启动时就把历史上无界累积的条目收敛掉，否则要等下一次 after_turn 才生效
+        cap = self._effect_max_per_type()
+        if cap > 0:
+            effects, removed = _cap_effects(effects, cap)
+            if removed:
+                await _maybe_await_call(self.db, "remove_effects", removed, default=0)
+                logger.info(
+                    "启动清理：短期影响超出上限（每类 %d 条），已清理 %d 条",
+                    cap,
+                    len(removed),
+                )
         return effects
 
     async def _load_todos(self) -> list[Todo]:
@@ -1890,6 +1936,19 @@ class PersonaAgent:
             cue = _coerce_cue(item)
             if cue is not None:
                 cues.append(cue)
+        # 启动时就把历史上无界累积的条目收敛掉，否则要等下一次 after_turn 才生效
+        cap = self._cue_max_per_conversation()
+        total_cap = self._cue_max_total()
+        if cap > 0 or total_cap > 0:
+            cues, removed = _cap_cues(cues, cap, total_cap)
+            if removed:
+                await _maybe_await_call(self.db, "remove_cues", removed, default=0)
+                logger.info(
+                    "启动清理：线索超出上限（每会话 %d 条 / 全局 %d 条），已清理 %d 条",
+                    cap,
+                    total_cap,
+                    len(removed),
+                )
         return cues
 
     async def _load_profiles(self) -> dict[str, UserProfile]:
@@ -1976,6 +2035,88 @@ class PersonaAgent:
     def _upsert_effect_cache(self, effect: Effect) -> None:
         self._effects = [item for item in self._effects if item.id != effect.id]
         self._effects.append(effect)
+
+    def _effect_max_per_type(self) -> int:
+        value = _read_number(
+            self.pm_cfg,
+            "persona_agent",
+            "effect_max_per_type",
+            default=10,
+        )
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 10
+
+    async def _enforce_effect_cap_locked(self) -> list[str]:
+        """把 `self._effects` 收敛到每种 effect_type 最多 N 条，并落库。
+
+        短期影响由模型每轮自行生成，不封顶就会无界增长（实测 69 条、约
+        1 条/2.6 分钟、每条存活十几小时）。后果有两层：
+          1. 角色被十几小时前的一次性情绪描述淹没，而主模型只看得到最旧的几条；
+          2. 人格维护 prompt 每轮全量回灌几十 K 字符，且模型顺手改任意一条旧
+             effect 都会让从其位置起的整段前缀缓存失效 —— 条目越多越容易被改中。
+        返回被移除的 id。
+        """
+        cap = self._effect_max_per_type()
+        if cap <= 0 or not self._effects:
+            return []
+        kept, removed = _cap_effects(self._effects, cap)
+        if not removed:
+            return []
+        self._effects = kept
+        await _maybe_await_call(self.db, "remove_effects", removed, default=0)
+        logger.info("短期影响超出上限（每类 %d 条），已清理 %d 条", cap, len(removed))
+        return removed
+
+    def _cue_max_per_conversation(self) -> int:
+        value = _read_number(
+            self.pm_cfg,
+            "persona_agent",
+            "cue_max_per_conversation",
+            default=10,
+        )
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 10
+
+    async def _enforce_cue_cap_locked(self) -> list[str]:
+        """把 `self._cues` 收敛到每会话最多 N 条，并落库。
+
+        线索同样是模型每轮生成的短期产物，不封顶会无界增长（实测 143 条、
+        单群 91 条、一小时新建 58 条），是人格维护 prompt 里最大的一段
+        （约 25K 字符），也是持续打断前缀缓存的主因。
+        返回被移除的 id。
+        """
+        cap = self._cue_max_per_conversation()
+        total_cap = self._cue_max_total()
+        if (cap <= 0 and total_cap <= 0) or not self._cues:
+            return []
+        kept, removed = _cap_cues(self._cues, cap, total_cap)
+        if not removed:
+            return []
+        self._cues = kept
+        await _maybe_await_call(self.db, "remove_cues", removed, default=0)
+        logger.info(
+            "线索超出上限（每会话 %d 条 / 全局 %d 条），已清理 %d 条",
+            cap,
+            total_cap,
+            len(removed),
+        )
+        return removed
+
+    def _cue_max_total(self) -> int:
+        value = _read_number(
+            self.pm_cfg,
+            "persona_agent",
+            "cue_max_total",
+            default=20,
+        )
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 20
 
     def _remove_effect_cache(self, effect_id: str) -> None:
         self._effects = [item for item in self._effects if item.id != effect_id]

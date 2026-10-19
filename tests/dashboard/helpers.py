@@ -1,10 +1,7 @@
-"""Dashboard 测试共享 helper。"""
-
-# ruff: noqa: I001
+"""Dashboard 纯逻辑测试共享 helper（不依赖 Qt）。"""
 
 from __future__ import annotations
 
-import asyncio
 from types import SimpleNamespace
 
 from app_config.schema import (
@@ -14,14 +11,7 @@ from app_config.schema import (
     ProviderConfig,
     RootConfig,
 )
-
-try:
-    from PySide6.QtWidgets import QApplication, QWidget
-    from ui.widgets.wheel_freeze import WheelFreezeFilter
-except ImportError:  # pragma: no cover - 这些 helper 只在 Qt 测试中使用
-    QApplication = None
-    WheelFreezeFilter = None
-    QWidget = None
+from core.chat_timeline import ChatTimelineMessage
 
 
 def minimal_root_config() -> RootConfig:
@@ -61,47 +51,201 @@ def dashboard_runtime(tmp_paths, cfg: RootConfig | None = None) -> SimpleNamespa
     )
 
 
-async def pump_dashboard_events(qapp, rounds: int = 1) -> None:
-    for _ in range(rounds):
-        qapp.processEvents()
-        await asyncio.sleep(0)
+class StaticRecordStore:
+    def __init__(self, records):
+        self._records = records
+
+    async def records(self):
+        return list(self._records)
 
 
-async def wait_for_dashboard_condition(qapp, condition, *, rounds: int = 50) -> None:
-    for _ in range(rounds):
-        if condition():
-            return
-        await pump_dashboard_events(qapp)
-    assert condition()
+class PagedArchiveStore:
+    def __init__(self, records, *, page_size: int = 500):
+        self._records = list(records)
+        self.page_size = page_size
+        self.filter_calls = []
+        self.get_by_ids_calls = []
+        self.records_called = False
+
+    async def records(self):
+        self.records_called = True
+        raise AssertionError("archive.records should not be used when filter_records exists")
+
+    async def filter_records(self, query):
+        self.filter_calls.append(dict(query))
+        offset = int(query.get("offset") or 0)
+        limit = min(int(query.get("limit") or self.page_size), self.page_size)
+        selected = self._records[offset:offset + limit]
+        return {
+            "ok": True,
+            "count": len(selected),
+            "total": len(self._records),
+            "limit": limit,
+            "offset": offset,
+            "order": query.get("order") or "asc",
+            "results": [
+                {
+                    "id": item["archive_id"],
+                    "time": item.get("timestamp"),
+                    "conversation_id": item.get("conversation_id"),
+                    "sender": item.get("sender_name") or "-",
+                    "sender_id": item.get("sender_id"),
+                    "sender_name": item.get("sender_name"),
+                    "direction": item.get("direction") or "inbound",
+                    "kind": item.get("kind") or "text",
+                    "content": item.get("content") or "",
+                    "metadata": item.get("metadata") or {},
+                }
+                for item in selected
+            ],
+        }
+
+    async def get_by_ids(self, archive_ids):
+        self.get_by_ids_calls.append(list(archive_ids))
+        by_id = {item["archive_id"]: item for item in self._records}
+        return [dict(by_id[archive_id]) for archive_id in archive_ids if archive_id in by_id]
 
 
-def close_settings_page(page, qapp) -> None:
-    remove_wheel_freeze_filters(page)
-    page.close()
-    for _ in range(3):
-        qapp.processEvents()
-    page.deleteLater()
-    for _ in range(3):
-        qapp.processEvents()
+class FailingRecordStore:
+    async def records(self):
+        raise RuntimeError("boom")
 
 
-def remove_wheel_freeze_filters(root) -> None:
-    if QApplication is None or QWidget is None or WheelFreezeFilter is None:
-        return
-    app = QApplication.instance()
-    filters = []
-    stored_filter = getattr(root, "_wheel_freeze_filter", None)
-    if isinstance(stored_filter, WheelFreezeFilter):
-        filters.append(stored_filter)
-    filters.extend(root.findChildren(WheelFreezeFilter))
-    seen = set()
-    widgets = [root, *root.findChildren(QWidget)]
-    for wheel_filter in filters:
-        marker = id(wheel_filter)
-        if marker in seen:
-            continue
-        seen.add(marker)
-        if app is not None:
-            app.removeEventFilter(wheel_filter)
-        for widget in widgets:
-            widget.removeEventFilter(wheel_filter)
+class FakeEventStore:
+    def __init__(self, events=None, *, fail: bool = False, include_mismatched: bool = False):
+        self._events = list(events or [])
+        self.fail = fail
+        self.include_mismatched = include_mismatched
+        self.calls = []
+        self.wait_projected_calls = []
+
+    async def wait_projected(self, event_id=None, timeout=None):
+        self.wait_projected_calls.append({"event_id": event_id, "timeout": timeout})
+        return True
+
+    async def events_by_type(
+        self,
+        event_type,
+        *,
+        limit=100,
+        after_event_id=None,
+        before_event_id=None,
+        order="asc",
+    ):
+        self.calls.append(
+            {
+                "event_type": event_type,
+                "limit": limit,
+                "after_event_id": after_event_id,
+                "before_event_id": before_event_id,
+                "order": order,
+            }
+        )
+        if self.fail:
+            raise RuntimeError("event store failed")
+        selected = [event for event in self._events if event.get("event_type") == event_type]
+        if self.include_mismatched:
+            selected.extend(
+                event for event in self._events if event.get("event_type") != event_type
+            )
+        selected = sorted(
+            selected,
+            key=lambda event: int(event.get("event_id") or 0),
+            reverse=order == "desc",
+        )
+        return [dict(event) for event in selected[: int(limit)]]
+
+
+def timeline_record(
+    *,
+    conversation_id: str,
+    direction: str,
+    text: str,
+    msg_id: str,
+    timestamp: float,
+    time_text: str,
+    sender_name: str = "用户",
+    sender_id: str = "10001",
+) -> ChatTimelineMessage:
+    return ChatTimelineMessage(
+        conversation_id=conversation_id,
+        direction=direction,
+        timestamp=timestamp,
+        time_text=time_text,
+        sender_name=sender_name,
+        sender_id=sender_id,
+        target_id=conversation_id.split(":", 1)[1],
+        group_id=None,
+        msg_id=msg_id,
+        text=text,
+        raw_message=text,
+    )
+
+
+def qq_event(
+    event_id: int,
+    event_type: str,
+    *,
+    conversation_id: str = "private:10001",
+    content: str = "消息",
+    msg_id: str = "m-1",
+    timestamp_unix: float = 1_780_000_001.0,
+    payload: dict | None = None,
+):
+    base_payload = {
+        "conversation_id": conversation_id,
+        "content": content,
+        "msg_id": msg_id,
+        "timestamp_unix": timestamp_unix,
+    }
+    if event_type == "qq_message_received":
+        base_payload.update(
+            {
+                "direction": "inbound",
+                "user_id": "10001",
+                "sender_name": "用户",
+                "target_id": "10001",
+                "self_id": "999",
+            }
+        )
+    elif event_type == "qq_message_sent":
+        base_payload.update(
+            {
+                "direction": "outbound",
+                "target_scope": conversation_id.split(":", 1)[0],
+                "target_id": conversation_id.split(":", 1)[1],
+                "self_id": "999",
+            }
+        )
+    if payload:
+        base_payload.update(payload)
+    return {
+        "event_id": event_id,
+        "event_type": event_type,
+        "conversation_id": conversation_id,
+        "source": "fake",
+        "external_id": msg_id,
+        "timestamp_unix": timestamp_unix,
+        "payload": base_payload,
+    }
+
+
+def runtime_event(
+    event_id: int,
+    event_type: str,
+    *,
+    conversation_id: str = "private:10001",
+    payload: dict | None = None,
+    tool_call_id: str | None = None,
+    external_id: str | None = None,
+):
+    return {
+        "event_id": event_id,
+        "event_type": event_type,
+        "conversation_id": conversation_id,
+        "source": "fake",
+        "external_id": external_id,
+        "tool_call_id": tool_call_id,
+        "timestamp_unix": 1_780_000_001.0 + event_id,
+        "payload": dict(payload or {}),
+    }

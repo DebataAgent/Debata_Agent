@@ -12,8 +12,6 @@ from agents.persona_import import (
     copy_persona_dir,
     import_persona_zip,
 )
-from ui.wizard.context import WizardContext
-from ui.wizard.window import WizardWindow
 
 
 def _make_persona_dir(root: Path, name: str, prompt: str = "hi") -> Path:
@@ -64,23 +62,3 @@ def test_import_persona_zip_imports_single_valid_persona(tmp_path: Path):
     assert name == "alice"
     assert (tmp_path / "personas" / "alice" / "persona_prompt.py").exists()
     assert (tmp_path / "personas" / "alice" / "avatar.txt").exists()
-
-
-def test_wizard_create_persona_rejects_duplicate(tmp_paths):
-    _make_persona_dir(tmp_paths.PERSONAS_DIR, "alice")
-    ctx = WizardContext()
-    ctx.persona.source = "create"
-    ctx.persona.active = "alice"
-    ctx.persona.generated_xml = "<identity>Alice</identity>"
-
-    dummy = type(
-        "WizardStub",
-        (),
-        {
-            "_context": ctx,
-            "_paths": tmp_paths,
-        },
-    )()
-
-    with pytest.raises(PersonaImportError, match="已存在"):
-        WizardWindow._save_persona_if_needed(dummy)

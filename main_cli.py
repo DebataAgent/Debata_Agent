@@ -64,9 +64,9 @@ def _cli_choose(
 
 
 def _cli_load_presets(paths) -> dict[str, Any]:
-    from providers.presets_loader import load_all_presets
+    from providers.presets_loader import load_presets_for
 
-    return load_all_presets(paths.PROVIDER_PRESETS_DIR)
+    return load_presets_for(paths)
 
 
 def _cli_default_model(
@@ -132,7 +132,7 @@ def _cli_provider_config(
     default_model = current_model or _cli_default_model(
         presets,
         preset_id,
-        "deepseek-v4-flash",
+        "deepseek-flash",
     )
     model = _cli_text("模型 ID", default_model)
 
@@ -585,19 +585,19 @@ def _run_cli_wizard_legacy(paths) -> None:
             agents=AgentsConfig(
                 chat=AgentConfig(
                     provider="deepseek_main",
-                    model="deepseek-v4-flash",
+                    model="deepseek-flash",
                     temperature=0.6,
                     max_tokens=16384,
                 ),
                 proactive=AgentConfig(
                     provider="deepseek_main",
-                    model="deepseek-v4-flash",
+                    model="deepseek-flash",
                     temperature=0.3,
                     max_tokens=64,
                 ),
                 summary=AgentConfig(
                     provider="deepseek_main",
-                    model="deepseek-v4-flash",
+                    model="deepseek-flash",
                     temperature=0.1,
                     max_tokens=8192,
                 ),
@@ -613,7 +613,7 @@ def _run_cli_wizard_legacy(paths) -> None:
     print("\n" + "-" * 60)
     print("即将写入以下配置：")
     print(f"  人格        : {persona_name}")
-    print("  Provider    : DeepSeek（model=deepseek-v4-flash）")
+    print("  Provider    : DeepSeek（model=deepseek-flash）")
     print(f"  Adapter mode: {mode}")
     print(f"  WS endpoint : ws://{host}:{port}{path}")
     if mode == "server":
@@ -683,19 +683,19 @@ def _run_cli_wizard(paths) -> None:
             agents=AgentsConfig(
                 chat=_cli_agent_config(
                     "main_provider",
-                    "deepseek-v4-flash",
+                    "deepseek-flash",
                     temperature=0.6,
                     max_tokens=16384,
                 ),
                 proactive=_cli_agent_config(
                     "main_provider",
-                    "deepseek-v4-flash",
+                    "deepseek-flash",
                     temperature=0.3,
                     max_tokens=64,
                 ),
                 summary=_cli_agent_config(
                     "main_provider",
-                    "deepseek-v4-flash",
+                    "deepseek-flash",
                     temperature=0.1,
                     max_tokens=8192,
                 )

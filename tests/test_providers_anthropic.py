@@ -7,7 +7,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from providers.base import CompletionResult
+import pytest
+
+from providers.base import CompletionResult, ProviderError
 from providers.protocols.anthropic_proto import AnthropicProvider
 
 
@@ -227,3 +229,86 @@ def test_convert_tools_handles_flat_format():
     flat = [{"name": "f", "description": "d", "parameters": {"type": "object"}}]
     converted = AnthropicProvider._convert_tools(flat)
     assert converted[0]["name"] == "f"
+
+
+# ============================================================
+# 流式调用的参数契约
+# ============================================================
+
+
+class _FakeStreamCtx:
+    """替身：AsyncMessages.stream() 的上下文管理器，只记录收到的 kwargs。"""
+
+    def __init__(self, captured: dict):
+        self._captured = captured
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def __aiter__(self):
+        async def _gen():
+            if False:  # pragma: no cover - 只为把它变成 async generator
+                yield None
+
+        return _gen()
+
+
+def _provider_with_fake_stream(captured: dict) -> AnthropicProvider:
+    provider = object.__new__(AnthropicProvider)
+    provider.name = "fake"
+
+    class _Messages:
+        def stream(self, **kwargs):
+            captured.update(kwargs)
+            return _FakeStreamCtx(captured)
+
+    provider._client = SimpleNamespace(messages=_Messages())
+    return provider
+
+
+@pytest.mark.asyncio
+async def test_stream_call_does_not_pass_stream_kwarg():
+    """回归：不能把 stream=True 传给 client.messages.stream()。
+
+    AsyncMessages.stream() 没有 ``stream`` 形参（流式已由方法本身决定），
+    传了会抛 ``TypeError: unexpected keyword argument 'stream'``。
+    这个错误在 14:05 的日志里让 anthropic 协议的**每一次调用**都在发请求前崩掉，
+    表现为 AgentRunner 记一条含糊的「未知错误」、用户收不到任何回复。
+    """
+    captured: dict = {}
+    provider = _provider_with_fake_stream(captured)
+
+    await provider._stream_call(
+        {"model": "claude-opus-4-8", "messages": [{"role": "user", "content": "hi"}]},
+        first_token_timeout=None,
+    )
+
+    assert "stream" not in captured, (
+        "kwargs 里不能出现 stream —— messages.stream() 不接受该参数，会直接 TypeError"
+    )
+    assert captured["model"] == "claude-opus-4-8"
+
+
+@pytest.mark.asyncio
+async def test_type_error_surfaces_as_provider_error():
+    """SDK 调用签名写错时要报成 ProviderError，而不是冒到上层变「未知错误」。"""
+    provider = object.__new__(AnthropicProvider)
+    provider.name = "fake"
+
+    class _Boom:
+        def stream(self, **kwargs):
+            raise TypeError("unexpected keyword argument 'stream'")
+
+    provider._client = SimpleNamespace(messages=_Boom())
+
+    with pytest.raises(ProviderError) as excinfo:
+        await provider.chat_completion(
+            [{"role": "user", "content": "hi"}],
+            model="claude-opus-4-8",
+            stream=True,
+            first_token_timeout=None,
+        )
+    assert "内部错误" in str(excinfo.value)

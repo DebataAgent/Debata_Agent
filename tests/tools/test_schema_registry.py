@@ -154,20 +154,15 @@ def test_send_targets_reject_invalid_delay(delay):
         )
 
 
-def test_non_no_action_schemas_expose_finish_after_success():
-    specs = {s.name: s for s in get_default_specs()}
-
-    for spec in specs.values():
-        schema_props = spec.to_openai_schema()["function"]["parameters"].get(
+def test_schemas_do_not_expose_finish_after_success():
+    """发送成功自动收尾替代了通用 finish_after_success 参数。"""
+    for spec in get_default_specs():
+        openai_props = spec.to_openai_schema()["function"]["parameters"].get(
             "properties", {}
         )
         full_props = spec.full_parameters_schema().get("properties", {})
-        if spec.name == "no_action":
-            assert "finish_after_success" not in schema_props
-            assert "finish_after_success" not in full_props
-            continue
-        assert schema_props["finish_after_success"]["default"] is False
-        assert full_props["finish_after_success"]["default"] is False
+        assert "finish_after_success" not in openai_props
+        assert "finish_after_success" not in full_props
 
 
 def test_schema_no_refs_in_output():
@@ -601,7 +596,6 @@ def test_registry_upload_file_is_stub_schema():
     assert "upload_file" in reg
     assert set(schema_by_name["upload_file"]["parameters"]["properties"]) == {
         "_tool_search_required",
-        "finish_after_success",
     }
 
 
@@ -619,7 +613,7 @@ def test_registry_stub_and_full_schema_modes_are_stable():
     for name in STUB_SCHEMA_TOOLS:
         assert name in schema_by_name
         props = schema_by_name[name]["parameters"]["properties"]
-        assert set(props) == {"_tool_search_required", "finish_after_success"}
+        assert set(props) == {"_tool_search_required"}
     filter_archive_spec = reg_disabled.get_spec("filter_archive_records")
     assert filter_archive_spec is not None
     assert {"archive", "history", "recall"}.issubset(filter_archive_spec.search_tags)
@@ -685,3 +679,60 @@ def test_registry_feature_tool_features_keys():
     all_names = {s.name for s in get_default_specs()}
     for tool_name in FEATURE_TOOL_FEATURES:
         assert tool_name in all_names
+
+
+def test_compact_profile_reduces_tools_and_hides_advanced_fields():
+    """compact profile：核心字段直出，高级字段按需 tool_search。"""
+    cfg = _make_config(tool_schema_profile="compact")
+    reg = build_default_registry(cfg)
+    schemas = reg.get_schemas()
+
+    send = next(
+        schema for schema in schemas
+        if schema["function"]["name"] == "send_group_message"
+    )
+    props = send["function"]["parameters"]["properties"]
+    assert "targets" in props
+    assert "group_id" in props
+    assert "reviewed_until_seq" not in props
+    assert "review_policy" not in props
+    assert "finish_after_success" not in props
+
+    full = reg.get_spec("send_group_message").tool_search_result(
+        detail="full"
+    )["parameters_schema"]
+    assert "reviewed_until_seq" in full["properties"]
+    assert "reply_to_message_id" in full["properties"]
+
+    # 隐藏字段仍在 Pydantic 模型中，执行时仍可传。
+    from tools.schemas import SendGroupArgs
+
+    parsed = SendGroupArgs.model_validate(
+        {
+            "group_id": 1,
+            "targets": [{"content": "hi", "order": 1, "delay": 0}],
+            "reviewed_until_seq": 5,
+        }
+    )
+    assert parsed.reviewed_until_seq == 5
+
+    upload = next(
+        schema for schema in schemas
+        if schema["function"]["name"] == "upload_file"
+    )
+    assert "_tool_search_required" in upload["function"]["parameters"]["properties"]
+
+    import json
+
+    import tiktoken
+
+    encoding = tiktoken.get_encoding("o200k_base")
+    total_tokens = sum(
+        len(
+            encoding.encode(
+                json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+            )
+        )
+        for schema in schemas
+    )
+    assert total_tokens <= 5_500

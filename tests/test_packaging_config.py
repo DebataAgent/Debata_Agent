@@ -27,9 +27,10 @@ def test_setuptools_find_packages_includes_runtime_subpackages():
     assert {
         "features.embedding",
         "plugins",
-        "ui.widgets",
-        "ui.wizard.step_views",
         "providers.protocols",
+        "webui",
+        "webui.chatlog",
+        "webui.wizard",
     } <= packages
 
 
@@ -38,6 +39,9 @@ def test_package_data_keeps_provider_presets_and_plugin_docs():
 
     assert "presets/*/preset.yaml" in package_data["providers"]
     assert "presets/*/tutorial/*.md" in package_data["providers"]
+    # 能力矩阵由 providers/model_capabilities.py 运行时读取，漏打包会让装后的
+    # wheel 在「获取模型列表」时 FileNotFound。
+    assert "model_capabilities.yaml" in package_data["providers"]
     assert "PLUGIN_SPEC.md" in package_data["plugins"]
     assert "voxcpm2/*.py" in package_data["plugins"]
     assert "embedding_bge_zh/*.py" in package_data["plugins"]

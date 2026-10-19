@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import asdict, fields, is_dataclass, replace
 from datetime import datetime
 from typing import Any
@@ -448,6 +449,73 @@ def _coerce_state(value: Any) -> PersonaState:
 
 def _coerce_effect(value: Any) -> Effect | None:
     return _coerce_dataclass(Effect, value)
+
+
+def _cap_grouped(
+    items: list[Any],
+    max_per_group: int,
+    group_key: Callable[[Any], str],
+) -> tuple[list[Any], list[str]]:
+    """按分组键限制每组条目数，每组只保留最新的若干条。
+
+    返回 (保留的条目, 被移除的 id)。**保留原有列表顺序**（渲染依赖它做
+    「最旧在前」），只挑出要丢弃的 id。
+
+    `max_per_group <= 0` 表示不限制，原样返回。
+    """
+    if max_per_group <= 0 or not items:
+        return list(items), []
+
+    grouped: dict[str, list[Any]] = {}
+    for item in items:
+        grouped.setdefault(group_key(item), []).append(item)
+
+    drop_ids: set[str] = set()
+    for group in grouped.values():
+        if len(group) <= max_per_group:
+            continue
+        # 最新的排在前面；created_at 相同用 id 兜底保证确定性
+        ordered = sorted(group, key=lambda i: (i.created_at, i.id), reverse=True)
+        drop_ids.update(item.id for item in ordered[max_per_group:])
+
+    if not drop_ids:
+        return list(items), []
+    kept = [item for item in items if item.id not in drop_ids]
+    return kept, [item.id for item in items if item.id in drop_ids]
+
+
+def _cap_effects(
+    effects: list[Effect],
+    max_per_type: int,
+) -> tuple[list[Effect], list[str]]:
+    """每种 effect_type 只保留最新的 `max_per_type` 条。"""
+    return _cap_grouped(effects, max_per_type, lambda e: e.effect_type or "unknown")
+
+
+def _cap_cues(
+    cues: list[Cue],
+    max_per_conversation: int,
+    max_total: int = 0,
+) -> tuple[list[Cue], list[str]]:
+    """线索双重封顶：先按会话限流，再按全局新旧淘汰。
+
+    两个上限各治一种病：
+      - `max_per_conversation` 防止话多的群把其它会话的线索挤光；
+      - `max_total` 防止低频会话（例如私聊）的旧线索无限期挂着 —— 实测有
+        19 小时前的私聊待接续意图一直留在 prompt 里，既陈旧又占前缀。
+
+    两步都保留最新的若干条，返回 (保留, 被移除的 id)。
+    """
+    kept, removed = _cap_grouped(
+        cues, max_per_conversation, lambda c: c.conversation_id or "unknown"
+    )
+    if max_total > 0 and len(kept) > max_total:
+        # 按全局新旧再收一次；同样保留最新
+        ordered = sorted(kept, key=lambda c: (c.created_at, c.id), reverse=True)
+        drop = {cue.id for cue in ordered[max_total:]}
+        removed = [*removed, *[cue.id for cue in kept if cue.id in drop]]
+        kept = [cue for cue in kept if cue.id not in drop]
+    return kept, removed
 
 
 def _coerce_todo(value: Any) -> Todo | None:

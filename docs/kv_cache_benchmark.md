@@ -81,6 +81,39 @@ venv/Scripts/python -m pytest tests/test_kv_cache_real.py -m live -s
 按 DeepSeek 当前定价（缓存命中 $0.014/百万 token，未命中 $0.28/百万 token），
 单轮有缓存时 prompt 成本约 $0.000014/轮，无缓存时约 $0.0048/轮。
 
+## 2026-10 上下文治理后的本地估算
+
+> 这一节不是 live API 命中率，而是对真实实例历史做的只读 prompt 估算，
+> 用于说明上下文治理的降幅。实际缓存命中率仍需部署后重跑 live 测试。
+
+数据来源：`~/.local/share/Debata_Agent/instances/default/memory/小堡/小堡.db`
+（活跃窗口 568 条记录），脚本 `scripts/benchmark_prompt_tokens.py`。
+
+| 指标 | 重构前 | 重构后 | 变化 |
+|---|---:|---:|---:|
+| 活跃历史 token | 185,173 | 43,248 | **-76.6%** |
+| 工具 schema token（full → compact） | 9,817 | 4,740 | **-51.7%** |
+| 估算单次 prompt | 206,768 | 59,766 | **-71.1%** |
+| 模型可见记录 | 568 | 296 | -47.9% |
+
+原因：
+
+- 模型视图只保留最近 2 个 `task_context`、2 条发送回执、4 组 `no_action`；
+  旧快照不再每轮重复发送。
+- 工具 schema 从 31 个 full 降为 11 个 compact + 其余 stub。
+- 发送成功后自动收尾，减少一次 `no_action` 模型调用。
+- 压缩触发按“模型可见视图 + 固定开销”计算，避免旧快照触发压缩。
+
+复测：
+
+```bash
+.venv/bin/python scripts/benchmark_prompt_tokens.py \
+  --db ~/.local/share/Debata_Agent/instances/default/memory/小堡/小堡.db \
+  --persona 小堡 --model deepseek-flash
+```
+
 ## 下次更新
 
+- 部署到生产后重跑 live KV cache 测试，确认 `kv_prefix_stable_hash` 与命中率
+- 若调整 `model_view` 保留数量、工具 schema 档位或摘要阈值，重跑 benchmark
 - 若 schema 结构调整（如 D 类整改后），需重跑确认未引入新破坏

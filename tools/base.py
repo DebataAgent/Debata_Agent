@@ -54,6 +54,7 @@ _TOOL_RESULT_FORMAT = "structured_json"
 
 class ToolSchemaMode(StrEnum):
     FULL = "full"
+    COMPACT = "compact"
     STUB = "stub"
 
 
@@ -252,7 +253,14 @@ class ToolSpec:
     """兼容旧调用方的工具元信息；runner 不再据此提前终止循环。"""
 
     schema_mode: ToolSchemaMode = ToolSchemaMode.FULL
-    """对模型暴露 full schema 还是 stub schema。"""
+    """对模型暴露 full / compact schema 还是 stub schema。"""
+
+    compact_hidden_fields: list[str] = field(default_factory=list)
+    """COMPACT 模式下不直接暴露的高级字段；仍保留在 Pydantic 模型里。
+
+    模型需要时可以通过 tool_search detail=full 查看完整 schema。隐藏字段的默认值
+    在多数场景足够使用。
+    """
 
     short_description: str | None = None
     """stub schema 和 tool_search 列表里使用的短说明。"""
@@ -273,18 +281,39 @@ class ToolSpec:
             - Pydantic 的 `$defs` / `$ref` 内联（OpenAI 不支持 $ref）
             - 移除 'title' 字段（仅用于 Pydantic 内部）
             - description 用工具 description 而非模型 docstring
+            - COMPACT 模式隐藏高级可选字段，完整 schema 走 tool_search detail=full
         """
         if self.schema_mode == ToolSchemaMode.STUB:
             return self.to_stub_openai_schema()
-        raw_schema = self.args_model.model_json_schema()
-        cleaned = _strip_pydantic_metadata(_inline_refs(raw_schema))
-        cleaned = _add_finish_after_success_parameter(cleaned, self.name)
+        if self.schema_mode == ToolSchemaMode.COMPACT:
+            return self.to_compact_openai_schema()
+        return self._full_openai_schema()
+
+    def _full_openai_schema(self) -> dict[str, Any]:
         return {
             "type": "function",
             "function": {
                 "name": self.name,
                 "description": self.description,
-                "parameters": cleaned,
+                "parameters": self.full_parameters_schema(),
+            },
+        }
+
+    def to_compact_openai_schema(self) -> dict[str, Any]:
+        parameters = self.full_parameters_schema()
+        parameters = _hide_optional_properties(parameters, self.compact_hidden_fields)
+        parameters = _truncate_schema_descriptions(parameters, limit=90)
+        description = self.short_description or self.description
+        if self.compact_hidden_fields:
+            description = (
+                f"{description.rstrip()} 高级参数可用 tool_search detail=full 查看。"
+            )
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": description,
+                "parameters": parameters,
             },
         }
 
@@ -297,28 +326,24 @@ class ToolSpec:
                     self.short_description
                     or f"{self.name} 是低频工具。调用前先用 tool_search 查询参数摘要和约束。"
                 ),
-                "parameters": _add_finish_after_success_parameter(
-                    {
-                        "type": "object",
-                        "properties": {
-                            "_tool_search_required": {
-                                "type": "boolean",
-                                "description": (
-                                    "这是占位参数。真实调用前必须先用 tool_search 查询参数摘要。"
-                                ),
-                            }
-                        },
-                        "additionalProperties": True,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "_tool_search_required": {
+                            "type": "boolean",
+                            "description": (
+                                "这是占位参数。真实调用前必须先用 tool_search 查询参数摘要。"
+                            ),
+                        }
                     },
-                    self.name,
-                ),
+                    "additionalProperties": True,
+                },
             },
         }
 
     def full_parameters_schema(self) -> dict[str, Any]:
         raw_schema = self.args_model.model_json_schema()
-        cleaned = _strip_pydantic_metadata(_inline_refs(raw_schema))
-        return _add_finish_after_success_parameter(cleaned, self.name)
+        return _strip_pydantic_metadata(_inline_refs(raw_schema))
 
     def tool_search_result(self, *, detail: Literal["summary", "full"] = "summary") -> dict[str, Any]:
         parameters = self.full_parameters_schema()
@@ -458,6 +483,8 @@ class ToolRegistry:
             if spec.name in self._specs:
                 raise ValueError(f"工具名冲突：{spec.name} 被注册了两次")
             self._specs[spec.name] = spec
+        # schema 在 registry 生命周期内不变；缓存后，token 估算也能按对象 id 复用。
+        self._schemas_cache: list[dict[str, Any]] | None = None
 
     def __contains__(self, name: str) -> bool:
         return name in self._specs
@@ -474,8 +501,15 @@ class ToolRegistry:
         return self._specs.get(name)
 
     def get_schemas(self) -> list[dict[str, Any]]:
-        """返回所有工具的 OpenAI schema 列表。空时返回 []（不要返回 None）。"""
-        return [s.to_openai_schema() for s in self._specs.values()]
+        """返回所有工具的 OpenAI schema 列表。空时返回 []（不要返回 None）。
+
+        返回的是 registry 内部缓存列表；调用方只读，不要原地修改。
+        """
+        if self._schemas_cache is None:
+            self._schemas_cache = [
+                spec.to_openai_schema() for spec in self._specs.values()
+            ]
+        return self._schemas_cache
 
     def get_no_feedback_names(self) -> set[str]:
         """返回所有 no_feedback=True 的工具名。
@@ -581,6 +615,9 @@ class ToolRegistry:
 
 
 def _ensure_tool_result_envelope(tool_name: str, result: dict[str, Any]) -> dict[str, Any]:
+    if tool_name == "no_action":
+        return {"ok": True, "no_action": True}
+
     enveloped = dict(result)
     if "ok" not in enveloped:
         enveloped["ok"] = _infer_tool_result_ok(enveloped)
@@ -836,6 +873,41 @@ def _schema_constraints_summary(schema: dict[str, Any]) -> dict[str, Any]:
     if schema.get("type") == "array" and "items" in schema:
         constraints["items"] = _schema_type_summary(schema["items"])
     return constraints
+
+
+def _hide_optional_properties(
+    schema: dict[str, Any],
+    hidden_fields: list[str],
+) -> dict[str, Any]:
+    """从 compact schema 中隐藏高级可选字段。
+
+    必填字段永远不会被隐藏；隐藏字段仍在 Pydantic 模型中声明，执行时仍可传。
+    """
+    if not hidden_fields:
+        return schema
+    patched = dict(schema)
+    properties = dict(patched.get("properties") or {})
+    required = {str(name) for name in patched.get("required") or []}
+    for name in hidden_fields:
+        if name not in required:
+            properties.pop(name, None)
+    patched["properties"] = properties
+    return patched
+
+
+def _truncate_schema_descriptions(node: Any, *, limit: int) -> Any:
+    """递归截断参数描述，保留类型/枚举/必填等结构信息。"""
+    if isinstance(node, dict):
+        result: dict[str, Any] = {}
+        for key, value in node.items():
+            if key == "description" and isinstance(value, str) and len(value) > limit:
+                result[key] = value[:limit].rstrip() + "…"
+            else:
+                result[key] = _truncate_schema_descriptions(value, limit=limit)
+        return result
+    if isinstance(node, list):
+        return [_truncate_schema_descriptions(item, limit=limit) for item in node]
+    return node
 
 
 def _add_finish_after_success_parameter(

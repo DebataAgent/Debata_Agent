@@ -35,7 +35,9 @@ from providers.base import (
     ReasoningConfig,
     ToolCall,
     Usage,
+    headers_with_neutral_user_agent,
 )
+from utils.proxy_env import sanitize_no_proxy_env
 
 logger = logging.getLogger(__name__)
 
@@ -65,11 +67,14 @@ class AnthropicProvider(IProvider):
         self.timeout = timeout
         self.extra_headers = extra_headers or {}
 
+        # 同 openai_compat：AsyncAnthropic 构造时展开 NO_PROXY，[::1] 会抛 InvalidURL。
+        sanitize_no_proxy_env()
+
         self._client = AsyncAnthropic(
             api_key=self.api_key,
             base_url=base_url,
             timeout=httpx.Timeout(timeout, connect=10.0),
-            default_headers=self.extra_headers or None,
+            default_headers=headers_with_neutral_user_agent(self.extra_headers),
         )
 
     async def aclose(self) -> None:
@@ -128,6 +133,12 @@ class AnthropicProvider(IProvider):
             raise ProviderTimeoutError(f"{self.name}: 超时: {e}") from e
         except APIError as e:
             raise ProviderError(f"{self.name}: API 错误: {e}") from e
+        except TypeError as e:
+            # 请求还没发出去就炸的编程错误（比如给 SDK 传了不存在的参数）。
+            # 不兜住的话它既不是 APIError 也不是 TimeoutError，会一路冒到 AgentRunner
+            # 的兜底分支，被记成含糊的「未知错误」，排查时得翻整个 traceback 才知道
+            # 其实是本地的调用签名写错了。
+            raise ProviderError(f"{self.name}: 内部错误（请求未发出）: {e}") from e
 
     # ============================================================
     # 协议翻译
@@ -246,9 +257,10 @@ class AnthropicProvider(IProvider):
     async def _stream_call(
         self, kwargs: dict[str, Any], first_token_timeout: float | None
     ) -> CompletionResult:
-        # Anthropic 用 stream=True 时返回的是 Stream
-        kwargs["stream"] = True
-
+        # 走的是 client.messages.stream()，流式已经由方法本身决定，
+        # 不能再往 kwargs 里塞 stream —— AsyncMessages.stream() 没有这个形参，
+        # 塞了会直接 TypeError: unexpected keyword argument 'stream'，
+        # 导致 anthropic 协议的每一次调用都在发请求前就崩掉。
         events: list[Any] = []
 
         try:

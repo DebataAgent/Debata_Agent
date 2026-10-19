@@ -6,11 +6,15 @@
 
 from __future__ import annotations
 
+import logging
+import os
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, fields, is_dataclass
 from html import escape
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 _REST_ACTIONS = {"eating", "sleeping", "collapsing"}
 _MISSING = object()
@@ -204,22 +208,14 @@ class PersonaContextView:
                 now=now,
             )
 
+        # 顺序按**实测稳定前缀长度**降序排，不是按假想的变化频率。
+        # 前缀缓存按「完整匹配的 token 块」命中，任何一段变化都会作废其后全部内容，
+        # 所以决定收益的是「前面这段能稳定多长」，而不是「它多久变一次」：
+        #   - 线索/短期影响体量最大（实测各占 25K/17K 字符），且每条按 created_at
+        #     稳定排序、新条目追加在尾部 —— 稳定前缀最长，放最前收益最大；
+        #   - 画像/待办虽小却会整体跳变（实测 287→231），放中间会把前缀截断；
+        #   - 状态/聊天现场/事件/画像变动每轮必变，压最末。
         sections = [
-            _event_section(event),
-            _episode_section(self.episode_buffer.state, self.episode_buffer),
-            _state_section(state),
-            _profile_section(context),
-            _records_section(
-                "短期影响",
-                _records_from(context, "effects", "active_effects", "short_term_effects"),
-                _EFFECT_FIELDS,
-            ),
-            _records_section(
-                "线索",
-                _records_from(context, "cues", "active_cues", "clues"),
-                _CUE_FIELDS,
-            ),
-            _todos_section(_records_from(context, "todos", "todo_items", "pending_todos")),
             _long_term_memory_section(
                 long_term_memory_text
                 if long_term_memory_text is not None
@@ -231,8 +227,54 @@ class PersonaContextView:
                     "memory_text",
                 )
             ),
+            _records_section(
+                "线索",
+                _records_from(context, "cues", "active_cues", "clues"),
+                _CUE_FIELDS,
+            ),
+            _records_section(
+                "短期影响",
+                _records_from(context, "effects", "active_effects", "short_term_effects"),
+                _EFFECT_FIELDS,
+            ),
+            _profile_section(context),
+            _todos_section(_records_from(context, "todos", "todo_items", "pending_todos")),
+            _state_section(state),
+            _episode_section(self.episode_buffer.state, self.episode_buffer),
+            _event_section(event),
+            _profile_audit_section(context),
         ]
+        _log_section_sizes(sections, self)
         return "\n\n".join(section for section in sections if section)
+
+
+_SECTION_NAMES: tuple[str, ...] = (
+    "长期记忆",
+    "线索",
+    "短期影响",
+    "画像",
+    "待办",
+    "当前状态",
+    "聊天现场",
+    "事件",
+    "最近画像变动",
+)
+
+
+def _log_section_sizes(sections: list[str], view: Any) -> None:
+    """按需打印各段字符数，用于定位「前缀被哪一段打断」。
+
+    只在 DEBATA_KV_SECTION_DIAG=1 时输出 —— 每段体积直接决定可缓存前缀的长度。
+    """
+    if os.environ.get("DEBATA_KV_SECTION_DIAG") != "1":
+        return
+    sizes = " ".join(
+        f"{name}={len(text)}"
+        for name, text in zip(_SECTION_NAMES, sections, strict=False)
+        if text
+    )
+    total = sum(len(text) for text in sections)
+    logger.info("人格上下文分段体积(字符) 合计=%d %s", total, sizes)
 
 
 def build_persona_context_text(
@@ -461,9 +503,8 @@ def _state_section(state: Any) -> str:
     return _wrap_section("当前状态", lines)
 
 
-def _profile_section(context: Any) -> str:
-    profile_records = _profile_records(context)
-    audit_records = _records_from(
+def _profile_audit_records(context: Any) -> list[Any]:
+    return _records_from(
         context,
         "profile_audits",
         "profile_audit_records",
@@ -471,15 +512,32 @@ def _profile_section(context: Any) -> str:
         "profile_changes",
         "profile_change_records",
     )
+
+
+def _profile_section(context: Any) -> str:
+    """长期画像本身（低频）。
+
+    「最近画像变动」不在这里 —— 它每轮都变，混进来会把此后所有 token 的前缀
+    全部作废，见 `_profile_audit_section`。
+    """
+    profile_records = _profile_records(context)
     lines: list[str] = []
     lines.extend(_format_record_lines(profile_records, _PROFILE_FIELDS, sort=False))
-    audit_lines = _format_record_lines(audit_records, _PROFILE_AUDIT_FIELDS)
-    if audit_lines:
-        lines.append("- 最近画像变动:")
-        lines.extend(f"  {line}" for line in audit_lines)
     if not lines:
         return ""
     return _wrap_section("当前对象画像", lines)
+
+
+def _profile_audit_section(context: Any) -> str:
+    """最近画像变动（每轮都变，排在上下文最末）。"""
+    audit_lines = _format_record_lines(
+        _profile_audit_records(context), _PROFILE_AUDIT_FIELDS
+    )
+    if not audit_lines:
+        return ""
+    lines = ["- 最近画像变动:"]
+    lines.extend(f"  {line}" for line in audit_lines)
+    return _wrap_section("最近画像变动", lines)
 
 
 def _records_section(title: str, records: list[Any], field_specs: tuple[tuple[str, tuple[str, ...]], ...]) -> str:

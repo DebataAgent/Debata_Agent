@@ -56,9 +56,17 @@ def test_budget_limit_schema_defaults_load_for_legacy_config():
     assert cfg.agents.chat.tool_loop_final_max_tokens == 4096
     assert cfg.behavior.summarize.trigger_at_tokens is None
     assert cfg.behavior.summarize.target_after_tokens is None
-    assert cfg.behavior.summarize.trigger_at_context_percent == 75
-    assert cfg.behavior.summarize.target_after_context_percent == 50
-    assert cfg.behavior.summarize.retry_target_after_context_percent == 30
+    assert cfg.behavior.summarize.trigger_at_context_percent == 50
+    assert cfg.behavior.summarize.target_after_context_percent == 30
+    assert cfg.behavior.summarize.retry_target_after_context_percent == 20
+    assert cfg.behavior.tool_schema_profile == "compact"
+    assert cfg.behavior.kv_prompt_diagnostics == "summary"
+    assert cfg.behavior.auto_finish_after_send is True
+    assert cfg.behavior.context.model_view.enabled is True
+    assert cfg.behavior.context.model_view.task_context_keep == 2
+    assert cfg.behavior.context.model_view.send_receipt_keep == 2
+    assert cfg.behavior.context.model_view.send_status_keep == 2
+    assert cfg.behavior.context.model_view.no_action_keep == 4
     assert "range_start_messages" not in type(cfg.behavior.summarize).model_fields
     assert "range_end_messages" not in type(cfg.behavior.summarize).model_fields
     assert cfg.behavior.context.prompt_overhead_estimate_tokens == 12000
@@ -96,9 +104,9 @@ def test_data_config_explicit_budget_defaults_roundtrip(tmp_paths):
     expected = {
         ("agents", "chat", "tool_loop_final_max_tokens"): 4096,
         ("features", "vision", "max_tokens"): 1024,
-        ("behavior", "summarize", "trigger_at_context_percent"): 75,
-        ("behavior", "summarize", "target_after_context_percent"): 50,
-        ("behavior", "summarize", "retry_target_after_context_percent"): 30,
+        ("behavior", "summarize", "trigger_at_context_percent"): 50,
+        ("behavior", "summarize", "target_after_context_percent"): 30,
+        ("behavior", "summarize", "retry_target_after_context_percent"): 20,
         ("behavior", "context", "prompt_overhead_estimate_tokens"): 12000,
         (
             "behavior",

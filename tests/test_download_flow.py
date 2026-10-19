@@ -11,15 +11,6 @@ import pytest
 from plugins import DownloadSource, PluginMeta, PluginRecord, PluginStatus
 from plugins.downloader import _download_one
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-QtWidgets = pytest.importorskip("PySide6.QtWidgets")
-QApplication = QtWidgets.QApplication
-
-
-@pytest.fixture(scope="module")
-def qapp():
-    return QApplication.instance() or QApplication([])
-
 
 class _SlowResponse:
     headers: dict[str, str] = {}
@@ -66,39 +57,11 @@ async def test_download_cancel_removes_partial_file(tmp_path: Path):
     assert not dest.exists()
 
 
-def test_models_detail_opens_install_guide_for_error_status(qapp):
-    from ui.dashboard.models_page import _ModelDetail
-
-    record = PluginRecord(
-        meta=PluginMeta(
-            name="voxcpm2",
-            display_name="VoxCPM2",
-            kind="tts",
-            model_dir="VoxCPM2",
-            auto_download=True,
-            download_sources=[
-                DownloadSource(
-                    url="https://example.com/model.bin",
-                    dest_filename="model.bin",
-                )
-            ],
-        ),
-        status=PluginStatus.ERROR,
-        error="network failed",
-    )
-
-    detail = _ModelDetail()
-    detail.set_record(record)
-
-    assert detail._btn_download.isEnabled()
-    assert detail._btn_download.text() == "安装指引"
-
-
 def test_install_guide_matches_nested_model_folder_and_preserves_dest_prefix(
     tmp_path: Path,
     monkeypatch,
 ):
-    from ui.widgets.model_install_guide import (
+    from webui.model_guide import (
         find_matching_record_for_folder,
         install_model_folder,
     )
@@ -142,7 +105,7 @@ def test_install_guide_matches_nested_model_folder_and_preserves_dest_prefix(
 
 
 def test_install_guide_markdown_contains_manual_steps(tmp_path: Path, monkeypatch):
-    from ui.widgets.model_install_guide import build_model_install_markdown
+    from webui.model_guide import build_model_install_markdown
 
     monkeypatch.setenv("DEBATA_MODELS_DIR", str(tmp_path / "models"))
     record = PluginRecord(
@@ -171,7 +134,7 @@ def test_install_guide_markdown_contains_manual_steps(tmp_path: Path, monkeypatc
 
 
 def test_voxcpm2_install_guide_mentions_project_ffmpeg_shared_dir():
-    from ui.widgets.model_install_guide import build_model_install_markdown
+    from webui.model_guide import build_model_install_markdown
 
     record = PluginRecord(
         meta=PluginMeta(
@@ -196,7 +159,7 @@ def test_voxcpm2_install_guide_mentions_project_ffmpeg_shared_dir():
 
 
 def test_missing_python_deps_uses_import_name_mapping(monkeypatch):
-    from ui.widgets import model_install_guide
+    from webui import model_guide as model_install_guide
 
     record = PluginRecord(
         meta=PluginMeta(
@@ -223,11 +186,11 @@ def test_missing_python_deps_uses_import_name_mapping(monkeypatch):
 
 
 def test_pip_install_args_use_selected_index():
-    from ui.widgets import model_install_guide
+    from webui import model_guide as model_install_guide
 
     deps = ["voxcpm>=2.0.0"]
 
-    assert model_install_guide._pip_install_args(deps, "tsinghua") == [
+    assert model_install_guide.pip_install_args(deps, "tsinghua") == [
         "-m",
         "pip",
         "install",
@@ -237,77 +200,20 @@ def test_pip_install_args_use_selected_index():
         "https://pypi.tuna.tsinghua.edu.cn/simple",
         "voxcpm>=2.0.0",
     ]
-    assert "-i" not in model_install_guide._pip_install_args(deps, "official")
+    assert "-i" not in model_install_guide.pip_install_args(deps, "official")
 
 
 def test_dependency_install_env_removes_proxy(monkeypatch):
-    from ui.widgets import model_install_guide
+    from webui import model_guide as model_install_guide
 
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example")
     monkeypatch.setenv("HTTP_PROXY", "http://proxy.example")
 
-    env = model_install_guide._dependency_install_env()
+    env = model_install_guide.dependency_install_env(dict(os.environ))
 
-    assert not env.contains("HTTPS_PROXY")
-    assert not env.contains("HTTP_PROXY")
-    assert env.value("PIP_NO_INPUT") == "1"
-
-
-def test_install_guide_shows_dependency_progress_panel(qapp, monkeypatch):
-    from ui.widgets import model_install_guide
-    from ui.widgets.model_install_guide import ModelInstallGuideDialog
-
-    record = PluginRecord(
-        meta=PluginMeta(
-            name="demo",
-            display_name="Demo",
-            kind="tts",
-            model_dir="demo",
-            python_deps=["definitely-missing-package>=1.0"],
-        ),
-        status=PluginStatus.NOT_INSTALLED,
-    )
-    monkeypatch.setattr(
-        model_install_guide,
-        "missing_python_deps",
-        lambda _record: ["definitely-missing-package>=1.0"],
-    )
-
-    dlg = ModelInstallGuideDialog(record)
-    try:
-        assert not dlg._dep_panel.isHidden()
-        assert dlg._pip_source.count() == 3
-        assert dlg._dep_install_btn.text() == "后台安装依赖"
-    finally:
-        dlg.close()
-        dlg.deleteLater()
-
-
-def test_install_guide_dialog_is_independent_non_modal(qapp):
-    from PySide6.QtCore import Qt
-
-    from ui.widgets.model_install_guide import ModelInstallGuideDialog
-
-    parent = QtWidgets.QWidget()
-    record = PluginRecord(
-        meta=PluginMeta(
-            name="demo",
-            display_name="Demo",
-            kind="tts",
-            model_dir="demo",
-        ),
-        status=PluginStatus.NOT_INSTALLED,
-    )
-
-    dlg = ModelInstallGuideDialog(record, parent)
-    try:
-        assert dlg.parent() is None
-        assert dlg.windowModality() == Qt.WindowModality.NonModal
-        assert dlg.windowFlags() & Qt.WindowType.WindowStaysOnTopHint
-    finally:
-        dlg.close()
-        dlg.deleteLater()
-        parent.deleteLater()
+    assert "HTTPS_PROXY" not in env
+    assert "HTTP_PROXY" not in env
+    assert env["PIP_NO_INPUT"] == "1"
 
 
 def test_plugin_install_status_requires_download_sources(tmp_path: Path):

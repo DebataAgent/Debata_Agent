@@ -524,5 +524,154 @@ async def test_sqlite_projection_failure_does_not_stop_agent_tool_execution(tmp_
     assert stats["projection_error_count"] >= 1
 
     store.fail_projection = False
-    assert await store.wait_projected(2, timeout=1.0)
+    # 低功耗 ARM 设备在系统负载高时，投影线程恢复可能超过 1 秒。
+    assert await store.wait_projected(2, timeout=5.0)
     await store.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_runner_auto_finishes_after_successful_send():
+    provider = ScriptedProvider(
+        [
+            CompletionResult(
+                tool_calls=[
+                    ToolCall(
+                        id="send-1",
+                        name="send_group_message",
+                        arguments='{"group_id":1,"targets":[]}',
+                    )
+                ],
+                finish_reason="tool_calls",
+                usage=Usage(prompt_tokens=10),
+            )
+        ]
+    )
+    executed: list[str] = []
+
+    async def executor(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        executed.append(name)
+        return {
+            "ok": True,
+            "status": "sent",
+            "qq_visible": True,
+            "sent": [{"msg_id": "1", "order": 1}],
+        }
+
+    runner = AgentRunner(
+        provider,
+        AgentConfig(provider="fake", model="fake", max_loops=5),
+    )
+    result = await runner.run(
+        [{"role": "user", "content": "说话"}],
+        tools=[_tool_schema("send_group_message")],
+        tool_executor=executor,
+        auto_finish_after_send=True,
+    )
+
+    assert result.finish_reason == "finish_after_send"
+    assert result.loop_count == 1
+    assert executed == ["send_group_message"]
+    assert len(provider.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_runner_auto_finish_disabled_keeps_no_action_flow():
+    provider = ScriptedProvider(
+        [
+            CompletionResult(
+                tool_calls=[
+                    ToolCall(
+                        id="send-1",
+                        name="send_group_message",
+                        arguments='{"group_id":1,"targets":[]}',
+                    )
+                ],
+                finish_reason="tool_calls",
+                usage=Usage(prompt_tokens=10),
+            ),
+            CompletionResult(
+                tool_calls=[ToolCall(id="na-1", name="no_action", arguments="{}")],
+                finish_reason="tool_calls",
+                usage=Usage(prompt_tokens=20),
+            ),
+        ]
+    )
+
+    async def executor(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        if name == "no_action":
+            return {"ok": True, "no_action": True}
+        return {
+            "ok": True,
+            "status": "sent",
+            "qq_visible": True,
+            "sent": [{"msg_id": "1", "order": 1}],
+        }
+
+    runner = AgentRunner(
+        provider,
+        AgentConfig(provider="fake", model="fake", max_loops=5),
+    )
+    result = await runner.run(
+        [{"role": "user", "content": "说话"}],
+        tools=[_tool_schema("send_group_message"), _tool_schema("no_action")],
+        tool_executor=executor,
+        auto_finish_after_send=False,
+    )
+
+    assert result.finish_reason == "no_action"
+    assert result.loop_count == 2
+    assert len(provider.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_runner_auto_finish_skips_when_other_tools_are_pending():
+    provider = ScriptedProvider(
+        [
+            CompletionResult(
+                tool_calls=[
+                    ToolCall(
+                        id="send-1",
+                        name="send_group_message",
+                        arguments='{"group_id":1,"targets":[]}',
+                    ),
+                    ToolCall(
+                        id="recent-1",
+                        name="get_recent_chat_messages",
+                        arguments="{}",
+                    ),
+                ],
+                finish_reason="tool_calls",
+                usage=Usage(prompt_tokens=10),
+            ),
+            CompletionResult(
+                tool_calls=[ToolCall(id="na-1", name="no_action", arguments="{}")],
+                finish_reason="tool_calls",
+                usage=Usage(prompt_tokens=20),
+            ),
+        ]
+    )
+
+    async def executor(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        if name == "no_action":
+            return {"ok": True, "no_action": True}
+        return {
+            "ok": True,
+            "status": "sent",
+            "qq_visible": True,
+            "sent": [{"msg_id": "1", "order": 1}],
+        }
+
+    runner = AgentRunner(
+        provider,
+        AgentConfig(provider="fake", model="fake", max_loops=5),
+    )
+    result = await runner.run(
+        [{"role": "user", "content": "说话"}],
+        tools=[_tool_schema("send_group_message"), _tool_schema("no_action")],
+        tool_executor=executor,
+        auto_finish_after_send=True,
+    )
+
+    assert result.finish_reason == "no_action"
+    assert result.loop_count == 2
+    assert len(provider.calls) == 2

@@ -81,7 +81,7 @@ providers:
     vision_reuse: false
     vision_reuse_note: "DeepSeek 无视觉模型，vision 需独立 provider"
     models:
-      - id: deepseek-v4-flash
+      - id: deepseek-flash
         display_name: DeepSeek V4 Flash（推荐 · 1M 上下文）
         capabilities: [chat, tool_call, reasoning]
         context_length: 1000000
@@ -399,6 +399,33 @@ providers:
   # =========================================================================
   # OpenRouter
   # =========================================================================
+  # =========================================================================
+  # 小米 MiMo
+  # =========================================================================
+  mimo:
+    display_name: 小米 MiMo
+    protocol: openai_compat
+    base_url: https://api.xiaomimimo.com/v1
+    reasoning_style: thinking_extra_body
+    has_embedding: false
+    embedding_note: "MiMo 不提供 embedding API，RAG 需选其他 provider"
+    vision_reuse: true
+    vision_reuse_note: "mimo-v2.5 原生全模态可复用；mimo-v2.5-pro 仅文本输入，需另配视觉模型"
+    models:
+      - id: mimo-v2.5-pro
+        display_name: MiMo V2.5 Pro
+        capabilities: [chat, tool_call, reasoning]
+        context_length: 1000000
+        status: recommended
+        notes: "旗舰；1M 上下文 / 128K 输出；Agent 与长程代码任务见长；仅文本输入"
+      - id: mimo-v2.5
+        display_name: MiMo V2.5
+        capabilities: [chat, tool_call, reasoning, vision]
+        context_length: 1000000
+        status: active
+        notes: "原生全模态：图像 / 视频 / 音频 / 文本联合理解；1M 上下文"
+    deprecated_models: []
+
   openrouter:
     display_name: OpenRouter
     protocol: openai_compat

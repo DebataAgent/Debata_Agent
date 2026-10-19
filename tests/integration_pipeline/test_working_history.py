@@ -91,12 +91,12 @@ async def test_working_history_budget_uses_context_budget_and_prompt_overhead(bu
     context.reserve_output_tokens = 2_000
     context.memory_token_budget = 3_000
     context.summary_token_budget = 4_000
-    context.prompt_overhead_estimate_tokens = 5_000
-
+    # 固定开销现在来自实际 system prompt + 工具 schema；测试里直接注入缓存值，
+    # 让断言只验证预算公式本身。
+    pipeline._fixed_prompt_overhead_cache = 5_000
     assert pipeline._working_history_budget() == 6_000
 
-    context.prompt_overhead_estimate_tokens = 20_000
-
+    pipeline._fixed_prompt_overhead_cache = 20_000
     assert pipeline._working_history_budget() == 1
 
 

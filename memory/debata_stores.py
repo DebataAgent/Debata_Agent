@@ -20,7 +20,12 @@ import orjson
 from mind import db_records as _persona_records
 from mind import db_schema as _persona_schema
 from providers.base import Usage
-from utils.usage_summary import UsageRange, UsageSummary, cutoff_timestamp
+from utils.usage_summary import (
+    UsageRange,
+    UsageSummary,
+    add_record_to_summary,
+    cutoff_timestamp,
+)
 
 from .archive_sqlite_filters import (
     _filter_order_sql,
@@ -2176,13 +2181,7 @@ class DebataUsageStatsStore:
             ts = float(record.get("ts") or 0)
             if cutoff is not None and ts < cutoff:
                 continue
-            summary.request_count += 1
-            summary.prompt_tokens += int(record.get("prompt_tokens") or 0)
-            summary.completion_tokens += int(record.get("completion_tokens") or 0)
-            summary.reasoning_tokens += int(record.get("reasoning_tokens") or 0)
-            summary.cached_tokens += int(record.get("cached_tokens") or 0)
-            summary.cache_creation_tokens += int(record.get("cache_creation_tokens") or 0)
-            summary.total_tokens += int(record.get("total_tokens") or 0)
+            add_record_to_summary(summary, record)
         return summary
 
     @property

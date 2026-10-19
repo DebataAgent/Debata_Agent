@@ -77,7 +77,9 @@ async def test_fetch_model_list_uses_env_proxy_without_forcing_none(monkeypatch)
     )
 
     assert ids == ["chat-model"]
-    assert clients[-1]["proxy"] == "http://127.0.0.1:7897"
+    # 环境代理仍然生效，但走 trust_env，不再显式传 proxy=：
+    # 显式传参会盖掉 httpx 的 NO_PROXY 判定，用户设了绕过规则也不生效。
+    assert "proxy" not in clients[-1]
     assert clients[-1]["trust_env"] is True
 
 
@@ -208,7 +210,7 @@ def test_model_capability_defaults_cover_vision_and_embedding():
     )
 
     assert model_supports("volcengine", "doubao-seed-2-0-lite-260428", "vision")
-    assert not model_supports("deepseek", "deepseek-v4-flash", "vision")
+    assert not model_supports("deepseek", "deepseek-flash", "vision")
 
     emb_provider = recommended_provider("embedding")
     assert emb_provider is not None
@@ -252,6 +254,83 @@ def test_load_all_presets_skips_underscore_dirs(tmp_path):
 
 
 # ============================================================
+# 多目录合并（内置 + 用户自定义）
+# ============================================================
+
+
+def _write_preset(root, dirname: str, preset_id: str, display_name: str, base_url: str):
+    d = root / dirname
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "preset.yaml").write_text(
+        f"id: {preset_id}\ndisplay_name: {display_name}\n"
+        f"protocol: openai_compat\nbase_url: {base_url}",
+        encoding="utf-8",
+    )
+
+
+def test_extra_dir_overrides_builtin_same_id(tmp_path):
+    """用户目录里的同名 id 覆盖主目录——这是「用内置预设走中转站」的实现基础。"""
+    builtin = tmp_path / "builtin"
+    user = tmp_path / "user"
+    _write_preset(builtin, "deepseek", "deepseek", "DeepSeek", "https://api.deepseek.com/v1")
+    _write_preset(user, "my_relay", "deepseek", "DeepSeek（中转）", "https://relay.example.com/v1")
+
+    presets = load_all_presets(builtin, extra_dirs=[user], force_reload=True)
+    assert presets["deepseek"].base_url == "https://relay.example.com/v1"
+    assert presets["deepseek"].display_name == "DeepSeek（中转）"
+
+
+def test_extra_dir_adds_new_preset(tmp_path):
+    """用户目录能引入内置列表里没有的厂商。"""
+    builtin = tmp_path / "builtin"
+    user = tmp_path / "user"
+    _write_preset(builtin, "deepseek", "deepseek", "DeepSeek", "https://api.deepseek.com/v1")
+    _write_preset(user, "acme", "acme", "Acme", "https://api.acme.example/v1")
+
+    presets = load_all_presets(builtin, extra_dirs=[user], force_reload=True)
+    assert set(presets) == {"deepseek", "acme"}
+
+
+def test_missing_extra_dir_is_ignored(tmp_path):
+    """首次启动时用户目录还没建，不能因此报错或丢内置预设。"""
+    builtin = tmp_path / "builtin"
+    _write_preset(builtin, "deepseek", "deepseek", "DeepSeek", "https://api.deepseek.com/v1")
+
+    presets = load_all_presets(
+        builtin, extra_dirs=[tmp_path / "does_not_exist"], force_reload=True
+    )
+    assert set(presets) == {"deepseek"}
+
+
+def test_extra_dirs_are_cached_separately(tmp_path):
+    """缓存键必须包含 extra_dirs，否则带/不带用户目录会互相污染。"""
+    builtin = tmp_path / "builtin"
+    user = tmp_path / "user"
+    _write_preset(builtin, "deepseek", "deepseek", "DeepSeek", "https://api.deepseek.com/v1")
+    _write_preset(user, "acme", "acme", "Acme", "https://api.acme.example/v1")
+
+    with_user = load_all_presets(builtin, extra_dirs=[user], force_reload=True)
+    without_user = load_all_presets(builtin)  # 命中另一个缓存键
+    assert "acme" in with_user
+    assert "acme" not in without_user
+    assert "deepseek" in without_user
+
+
+def test_mimo_preset_shape():
+    """MiMo 的思考开关是 extra_body={"thinking": ...}，必须用 thinking_extra_body。"""
+    presets = load_all_presets(PRESETS_DIR)
+    mimo = presets["mimo"]
+    assert mimo.reasoning_style == "thinking_extra_body"
+    assert {m.id for m in mimo.models} == {"mimo-v2.5-pro", "mimo-v2.5"}
+    assert mimo.base_url.startswith("https://api.xiaomimimo.com")
+    pro = next(m for m in mimo.models if m.id == "mimo-v2.5-pro")
+    assert "tool_call" in pro.capabilities
+    assert "vision" not in pro.capabilities  # 官方规格：pro 仅文本输入
+    plain = next(m for m in mimo.models if m.id == "mimo-v2.5")
+    assert "vision" in plain.capabilities  # 官方规格：v2.5 原生全模态
+
+
+# ============================================================
 # 内置预设完整性检查
 # ============================================================
 
@@ -261,7 +340,9 @@ def test_builtin_presets_load():
     assert len(presets) > 0, "至少应有一个内置预设"
 
     # 关键预设必须存在
-    expected = {"deepseek", "glm", "openai", "anthropic", "moonshot", "qwen", "volcengine"}
+    expected = {
+        "deepseek", "glm", "openai", "anthropic", "moonshot", "qwen", "volcengine", "mimo",
+    }
     assert expected.issubset(presets.keys()), (
         f"缺少关键预设: {expected - set(presets.keys())}"
     )

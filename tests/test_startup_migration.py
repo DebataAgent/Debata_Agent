@@ -44,13 +44,18 @@ def test_main_no_gui_initializes_data_before_config_check(tmp_path, monkeypatch)
     data_root = tmp_path / "system-data"
 
     monkeypatch.setenv("DEBATA_DATA_ROOT", str(data_root))
-    monkeypatch.setattr(app_main, "parse_args", lambda: app_main.argparse.Namespace(
+    # main(argv=None) 会把 argv 透传给 parse_args，所以替身要接受一个可选参数。
+    monkeypatch.setattr(app_main, "parse_args", lambda argv=None: app_main.argparse.Namespace(
         no_gui=True,
         config="",
         setup=False,
         napcat=False,
         test_adapter=False,
         list_secrets=False,
+        host="127.0.0.1",
+        port=8000,
+        token="",
+        no_auth=False,
     ))
     monkeypatch.setattr(app_main, "setup_logging", lambda *args, **kwargs: calls.append("setup_logging"))
     monkeypatch.setattr(app_main, "install_uvloop", lambda: calls.append("install_uvloop"))

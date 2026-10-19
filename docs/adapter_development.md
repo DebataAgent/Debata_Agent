@@ -187,5 +187,5 @@ async def test_send_text(adapter):
 - ✅ 实现 `IAdapter` 所有抽象方法
 - ✅ 单元测试 send / receive / 联系人 / 请求
 - ✅ 配置 schema 加好
-- ✅ 向导文案 `ui/wizard/copy.py` + `steps.py` 加渠道选项
+- ✅ 向导文案 `webui/wizard/copy.py` + `steps.py` 加渠道选项
 - ✅ 不修改 `IAdapter` 抽象（除非破坏性变更经讨论）

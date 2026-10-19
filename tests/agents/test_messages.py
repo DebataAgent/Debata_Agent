@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from agents.context_builder import build_messages, build_task_context
+from agents.context_builder import (
+    build_messages,
+    build_runtime_tail_blocks,
+    build_task_context,
+    first_tail_block_index,
+)
 from agents.persona_loader import Persona
 from providers.base import normalize_messages
 
@@ -124,31 +129,125 @@ def test_build_messages_rag_memory_is_tail_context_for_cache_stability():
     first = build_messages(
         p,
         history,
-        important_memory_text="重要记忆",
-        rag_context_text="RAG 片段 A",
+        important_memory_text="- 甲的记忆条目",
+        rag_context_text="召回内容甲",
         current_context="现在是 10:00",
         memory_mode="rag",
     )
     second = build_messages(
         p,
         history,
-        important_memory_text="重要记忆",
-        rag_context_text="RAG 片段 B",
+        important_memory_text="- 乙的记忆条目",
+        rag_context_text="召回内容乙",
         current_context="现在是 10:00",
         memory_mode="rag",
     )
 
+    # system 必须逐字节不变：记忆/召回的变化绝不能污染稳定前缀
+    # （注意工具协议文本本身就含「重要记忆」一词，所以按记忆正文断言）
     assert first[0]["content"] == second[0]["content"]
-    assert "RAG 片段 A" not in first[0]["content"]
-    assert "RAG 片段 B" not in second[0]["content"]
-    assert "重要记忆" in first[0]["content"]
-    assert "<long_term_memory" in first[0]["content"]
-    assert [m["role"] for m in first] == ["system", "user", "user", "user"]
+    assert "甲的记忆条目" not in first[0]["content"]
+    assert "乙的记忆条目" not in second[0]["content"]
+    assert "召回内容甲" not in first[0]["content"]
+
+    # 顺序：system → history → task_context → long_term_memory → rag
+    assert [m["role"] for m in first] == ["system", "user", "user", "user", "user"]
     assert "旧消息" in first[1]["content"]
     assert "task_context" in first[2]["content"]
     assert "不是用户新发言" in first[2]["content"]
-    assert "RAG 片段 A" in first[3]["content"]
+    assert "<long_term_memory" in first[3]["content"]
+    assert "甲的记忆条目" in first[3]["content"]
     assert "不是用户新发言" in first[3]["content"]
+    assert "召回内容甲" in first[4]["content"]
+
+    # 易变块之前的一切（含本轮 task_context）在两轮之间完全一致
+    assert first[:3] == second[:3]
+
+
+def test_system_message_stays_byte_identical_when_memory_and_summary_change():
+    """核心不变量：记忆与滚动摘要无论怎么变，system 与历史都必须原样可复用。"""
+    p = _persona()
+    history = [
+        {"role": "user", "content": "甲"},
+        {"role": "assistant", "content": "乙"},
+        {"role": "user", "content": "丙"},
+    ]
+    base = build_messages(p, history, current_context="现在是 10:00")
+    changed = build_messages(
+        p,
+        history,
+        important_memory_text="[重要记忆]\n- 张三换了工作",
+        rolling_summary_text="更早的对话摘要：他们在聊建模。",
+        current_context="现在是 10:00",
+    )
+
+    assert changed[0]["content"] == base[0]["content"]
+    assert "张三换了工作" not in changed[0]["content"]
+    assert "更早的对话摘要" not in changed[0]["content"]
+    # 历史段逐条相同
+    assert changed[1:4] == base[1:4]
+
+
+def test_tail_blocks_order_is_stability_descending():
+    """尾部顺序 = 稳定性递减：memory → summary → rag，越靠后越易变。"""
+    blocks = build_runtime_tail_blocks(
+        important_memory_text="记忆",
+        rolling_summary_text="摘要",
+        rag_context_text="召回",
+    )
+    assert [b["role"] for b in blocks] == ["user", "user", "user"]
+    assert "<long_term_memory" in blocks[0]["content"]
+    assert "<rolling_conversation_summary" in blocks[1]["content"]
+    assert "<retrieved_conversation_context" in blocks[2]["content"]
+    # 三块都带「不是用户新发言」提示，避免被模型当成真实用户输入
+    assert all("不是用户新发言" in b["content"] for b in blocks)
+
+
+def test_first_tail_block_index_points_at_task_context():
+    p = _persona()
+    history = [{"role": "user", "content": "旧消息"}]
+    messages = build_messages(
+        p,
+        history,
+        important_memory_text="记忆",
+        rolling_summary_text="摘要",
+        rag_context_text="召回",
+        current_context="现在是 10:00",
+    )
+    idx = first_tail_block_index(messages)
+    assert idx == 2  # system + history 之后就是 task_context
+    assert "task_context" in messages[idx]["content"]
+
+
+def test_first_tail_block_index_ignores_historical_task_context_records():
+    """历史里存着往轮的 task_context 记录，不能把整段历史误判成尾部块。"""
+    p = _persona()
+    history = [
+        {"role": "user", "content": "第一轮"},
+        {
+            "role": "user",
+            "content": "<task_context priority=\"medium\">\n现在是 09:00。\n</task_context>",
+            "metadata": {"kind": "task_context_snapshot"},
+        },
+        {"role": "assistant", "content": "回应"},
+        {"role": "user", "content": "第二轮"},
+    ]
+    messages = build_messages(
+        p,
+        history,
+        important_memory_text="记忆",
+        current_context="现在是 10:00",
+    )
+    # 尾部块只有：task_context(本轮) + long_term_memory
+    idx = first_tail_block_index(messages)
+    assert idx == 1 + len(history)
+    assert "现在是 10:00" in messages[idx]["content"]
+    assert "<long_term_memory" in messages[idx + 1]["content"]
+    # 稳定前缀里不含任何易变块标记
+    assert all(
+        marker not in messages[0]["content"]
+        for marker in ("<task_context", "<long_term_memory", "<rolling_conversation_summary")
+    )
 
 
 def test_build_messages_can_reuse_persisted_task_context_record_for_prefix_stability():

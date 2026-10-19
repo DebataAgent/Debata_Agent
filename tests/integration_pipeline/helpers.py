@@ -278,8 +278,21 @@ def build_pipeline(tmp_path):
         persona_db=None,
         eat_tool=False,
         sleep_tool=False,
+        auto_finish_after_send: bool | None = None,
+        model_view_enabled: bool | None = None,
+        tool_schema_profile: str | None = None,
     ):
         cfg = _make_root_config()
+        # 集成测试默认保留旧的可预测流程；新特性由专门测试显式开启。
+        cfg.behavior.auto_finish_after_send = (
+            bool(auto_finish_after_send)
+            if auto_finish_after_send is not None
+            else False
+        )
+        cfg.behavior.context.model_view.enabled = (
+            bool(model_view_enabled) if model_view_enabled is not None else False
+        )
+        cfg.behavior.tool_schema_profile = tool_schema_profile or "full"
         provider = ScriptedProvider(script)
         chat_agent = ChatAgent(provider, cfg.agents.chat)
         persona = _make_persona()

@@ -1,0 +1,27 @@
+id: mimo
+display_name: 小米 MiMo
+protocol: openai_compat
+base_url: https://api.xiaomimimo.com/v1
+registration_url: https://platform.xiaomimimo.com
+# MiMo 的思考开关走 extra_body={"thinking": {"type": "enabled"|"disabled"}}，
+# 与 DeepSeek/GLM 同款（官方 OpenAI 兼容示例里就是 `extra_body={"thinking": {"type": "disabled"}}`）。
+reasoning_style: thinking_extra_body
+
+# 注：Token Plan 订阅用户需把 base_url 换成
+# https://token-plan-cn.xiaomimimo.com/v1 并填专属 Key（tp- 开头）。
+# 在「设置 → 模型」里编辑该 provider 的 Base URL 即可，不必改本文件。
+#
+# 注：思考模式下官方不支持自定义 temperature / top_p（会被强制为 1.0 / 0.95），
+# 传了也不报错，只是不生效。
+
+models:
+  - id: mimo-v2.5-pro
+    display_name: MiMo V2.5 Pro（旗舰 · 1M 上下文）
+    capabilities: [chat, tool_call, reasoning]
+    context_length: 1000000
+
+  # v2.5 是原生全模态（图像 / 视频 / 音频 / 文本联合理解），故带 vision。
+  - id: mimo-v2.5
+    display_name: MiMo V2.5（全模态 · 1M 上下文）
+    capabilities: [chat, tool_call, reasoning, vision]
+    context_length: 1000000

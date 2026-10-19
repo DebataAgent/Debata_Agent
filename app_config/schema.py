@@ -61,6 +61,24 @@ class WhitelistConfig(StrictModel):
     """仅在 mode=whitelist 下生效：允许的群号列表。"""
 
 
+class BlacklistConfig(StrictModel):
+    """入站黑名单。命中即丢弃，优先级高于 whitelist 与管理员审核。
+
+    与 whitelist 的分工：whitelist 决定「谁能用」，blacklist 决定「谁永远不能用」。
+    即使 whitelist.mode=open（对所有人开放），黑名单里的对象也不会触发任何回复，
+    因此把骚扰账号 / 不希望被 AI 接话的群丢进来即可，无需收紧整体开放策略。
+    """
+
+    enabled: bool = False
+    """关掉时整份名单不生效，方便临时放行而不丢名单内容。"""
+
+    qq_ids: list[int] = Field(default_factory=list)
+    """被拉黑的 QQ 号：私聊直接丢弃，群聊中该成员的发言也不触发回复。"""
+
+    group_ids: list[int] = Field(default_factory=list)
+    """被拉黑的群号：该群所有消息一律丢弃。"""
+
+
 class NapCatAdapterConfig(StrictModel):
     type: Literal["napcat"] = "napcat"
     enabled: bool = True
@@ -179,6 +197,9 @@ class NapCatAdapterConfig(StrictModel):
     # 白名单
     whitelist: WhitelistConfig = Field(default_factory=WhitelistConfig)
 
+    # 黑名单（优先级高于白名单）
+    blacklist: BlacklistConfig = Field(default_factory=BlacklistConfig)
+
 
 # 未来扩展：Union[NapCatAdapterConfig, DiscordAdapterConfig, ...]
 AdapterConfig = Annotated[NapCatAdapterConfig, Field(discriminator="type")]
@@ -193,6 +214,21 @@ ProtocolType = Literal["openai_compat", "anthropic"]
 """支持的协议类型。其它厂商（gemini / volcengine / qwen / glm 等）都走 openai_compat。
 要新增协议须先在 providers/registry.py 的 PROTOCOL_REGISTRY 注册具体实现。"""
 
+ReasoningStyle = Literal[
+    "thinking_extra_body", "qwen_enable_thinking", "openai_native", "none"
+]
+"""向 OpenAI 兼容端点传达思考开关的方式：
+
+    thinking_extra_body   DeepSeek/GLM 风格，发 extra_body={"thinking": {"type": ...}}
+    qwen_enable_thinking  通义千问，发 extra_body={"enable_thinking": bool}
+    openai_native         不发任何字段（OpenAI o 系列隐式启用）
+    none                  不发任何字段，且明确不猜
+
+为何需要它：``none`` 与 ``openai_native`` 行为相同，但语义不同——前者表示
+"这是个不认识的中转站，别塞厂商私有字段"，后者表示"这是 OpenAI 官方端点"。
+没有这个字段时，无 preset 的自定义 provider 会落到 thinking_extra_body 默认值，
+把 ``{"thinking": {"type": "disabled"}}`` 发给中转站，严格网关会直接 400。"""
+
 
 class ProviderConfig(StrictModel):
     """LLM 提供商配置。
@@ -200,6 +236,8 @@ class ProviderConfig(StrictModel):
     两种使用方式：
         1. 引用内置预设：只填 preset 和 api_key_id
         2. 完全自定义：填 protocol、base_url、api_key_id（preset 留空）
+
+    两者可混用：preset 提供默认值，同名字段就地覆盖（常见于代理 / 中转站 URL）。
     """
 
     preset: str | None = None
@@ -222,6 +260,13 @@ class ProviderConfig(StrictModel):
 
     timeout_seconds: float = 120.0
     """整体请求超时（秒）。流式响应的首 token 超时另由 AgentConfig.first_token_timeout_seconds 控制。"""
+
+    reasoning_style: ReasoningStyle | None = None
+    """思考参数风格，仅 openai_compat 协议生效。
+
+    留空时：有 preset 则取 preset.yaml 的值；无 preset（自定义中转站）取 ``none``，
+    即不向端点发送任何厂商私有字段——这是能安全接入未知网关的前提。
+    """
 
     @model_validator(mode="after")
     def validate_provider(self) -> ProviderConfig:
@@ -251,7 +296,7 @@ class AgentConfig(StrictModel):
     """provider ID（必须在顶层 providers 字典中存在）"""
 
     model: str
-    """模型 ID，如 'deepseek-v4-flash'、'claude-sonnet-4-5'、'glm-4.7-flash'"""
+    """模型 ID，如 'deepseek-flash'、'deepseek-v4-pro'、'claude-sonnet-4-5'、'glm-4.7-flash'"""
 
     temperature: float = Field(default=0.6, ge=0.0, le=2.0)
     """采样温度。聊天主体推荐 0.6；总结/路由用 0.1~0.3。"""
@@ -573,6 +618,29 @@ class PersonaManagementPersonaAgentConfig(PersonaManagementAgentConfig):
 
     min_interval_seconds: int = Field(default=300, ge=0)
     """两次人格档案维护之间的最小间隔（秒）。"""
+
+    effect_max_per_type: int = Field(default=10, ge=0)
+    """每种 effect_type 最多保留多少条短期影响；0 = 不限制。
+
+    短期影响由模型每轮自行生成，若不封顶会无界增长（实测 69 条、约
+    1 条/2.6 分钟、每条存活十几小时）。除了让角色被陈旧情绪淹没，它还会
+    让人格维护 prompt 每轮全量回灌几十 K 字符并持续打断前缀缓存。
+    超限时保留最新的若干条，其余从存储中移除。"""
+
+    cue_max_per_conversation: int = Field(default=10, ge=0)
+    """每个会话最多保留多少条线索；0 = 不限制。
+
+    线索同样由模型每轮生成且无界增长（实测 143 条、单群 91 条、一小时新建
+    58 条），是人格维护 prompt 里最大的一段（约 25K 字符），也是打断前缀缓存
+    的主因。线索天然按会话划分，所以按 conversation_id 分别封顶，避免话多的
+    群把其它会话的线索挤掉。超限时保留最新的若干条，其余从存储中移除。"""
+
+    cue_max_total: int = Field(default=20, ge=0)
+    """线索全局最多保留多少条；0 = 不限制。
+
+    只有每会话上限是不够的：低频会话（如私聊）永远不超限，于是 19 小时前的
+    待接续意图会无限期留在 prompt 里。这一层按全局新旧淘汰，保证「线索」真的
+    只反映近期。两步都保留最新的若干条。"""
 
 
 class PersonaManagementSocialAgentConfig(PersonaManagementAgentConfig):
@@ -938,13 +1006,13 @@ class SummarizeConfig(StrictModel):
     target_after_tokens: int | None = None
     """滚动摘要后活跃窗口目标 token。显式配置优先于百分比推导。"""
 
-    trigger_at_context_percent: int = Field(default=75, ge=50, le=100)
+    trigger_at_context_percent: int = Field(default=50, ge=5, le=100)
     """未显式配置 trigger_at_tokens 时，按工作上下文预算此百分比推导滚动摘要触发阈值。"""
 
-    target_after_context_percent: int = Field(default=50, ge=50, le=100)
+    target_after_context_percent: int = Field(default=30, ge=5, le=100)
     """未显式配置 target_after_tokens 时，按工作上下文预算此百分比推导活跃窗口目标。"""
 
-    retry_target_after_context_percent: int = Field(default=30, ge=5, le=100)
+    retry_target_after_context_percent: int = Field(default=20, ge=5, le=100)
     """第一次压缩后仍超预算或压缩失败时，重试压缩使用的活跃窗口目标百分比。"""
 
     @model_validator(mode="before")
@@ -1074,11 +1142,39 @@ def default_tool_result_budgets() -> dict[str, ToolResultBudgetConfig]:
     }
 
 
+class ModelViewConfig(StrictModel):
+    """给模型看的历史视图裁剪策略（只影响 prompt，不删除落盘历史）。"""
+
+    enabled: bool = True
+    """关闭后恢复完整 active history。"""
+
+    task_context_keep: int = Field(default=2, ge=0, le=100)
+    """模型可见的最近 task_context 快照数量。"""
+
+    send_receipt_keep: int = Field(default=2, ge=0, le=100)
+    """模型可见的最近 send_receipt 数量。"""
+
+    send_status_keep: int = Field(default=2, ge=0, le=100)
+    """模型可见的最近 send_done / send_status 快照数量。"""
+
+    no_action_keep: int = Field(default=4, ge=0, le=200)
+    """模型可见的最近 no_action 调用组数量。"""
+
+    max_record_chars: int = Field(default=8000, ge=512)
+    """单条 user 记录进入模型视图的最大字符数；超出做头尾截断。"""
+
+    project_tool_results: bool = True
+    """是否把发送类工具结果投影成精简字段。"""
+
+
 class ContextConfig(StrictModel):
     """上下文预算配置。max_context_tokens 是工作预算，不是模型硬上限。"""
 
     max_context_tokens: int | None = None
     """None = 根据当前模型预设 context_length 推导工作预算。"""
+
+    model_view: ModelViewConfig = Field(default_factory=ModelViewConfig)
+    """给模型看的历史视图裁剪策略。"""
 
     recommended_context_budget: ContextBudgetRecommendationConfig = Field(
         default_factory=ContextBudgetRecommendationConfig
@@ -1173,6 +1269,15 @@ class BehaviorConfig(StrictModel):
     rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
     summarize: SummarizeConfig = Field(default_factory=SummarizeConfig)
     context: ContextConfig = Field(default_factory=ContextConfig)
+
+    tool_schema_profile: Literal["compact", "full"] = "compact"
+    """工具 schema 暴露档位：compact=核心字段直出、其余按需 tool_search；full=旧行为。"""
+
+    kv_prompt_diagnostics: Literal["off", "summary", "full"] = "summary"
+    """KV 诊断级别：off 关闭；summary 只做轻量计数；full 保留旧的全量序列化哈希。"""
+
+    auto_finish_after_send: bool = True
+    """发送成功后自动结束本轮工具循环，省掉一次 no_action 收尾调用。"""
 
     @model_validator(mode="before")
     @classmethod

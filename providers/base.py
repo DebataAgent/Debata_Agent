@@ -128,6 +128,33 @@ class ProviderUnsupportedError(ProviderError):
 
 
 # ============================================================
+# 官方 SDK 的 User-Agent 屏蔽绕行
+# ============================================================
+
+# openai-python 默认发 `OpenAI/Python <ver>`（异步类前缀 AsyncOpenAI），
+# anthropic-sdk-python 发 `Anthropic/Python <ver>`。部分中转站拿这两个头做风控，
+# 见到就回 `403 Your request was blocked`，从 SDK 抛出来是 PermissionDeniedError，
+# 看着像密钥没权限 —— 其实和密钥无关：同一个 key、同一个 body，只换 UA 立刻 200。
+NEUTRAL_USER_AGENT = "Debata_Agent/1.0"
+
+
+def headers_with_neutral_user_agent(
+    extra_headers: dict[str, str] | None,
+) -> dict[str, str] | None:
+    """在用户自定义头上补一个中性 User-Agent（不覆盖用户显式指定的）。
+
+    两个 SDK 都把 ``default_headers`` 合并在默认 UA **之后**，所以这里放进去的
+    UA 会生效。用户若自己配了 ``User-Agent``（大小写不敏感），保持用户的，
+    避免把有意为之的自定义头盖掉。
+    """
+    headers = dict(extra_headers or {})
+    if any(key.lower() == "user-agent" for key in headers):
+        return headers or None
+    headers["User-Agent"] = NEUTRAL_USER_AGENT
+    return headers
+
+
+# ============================================================
 # IProvider 抽象基类
 # ============================================================
 

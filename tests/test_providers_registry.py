@@ -79,6 +79,81 @@ def test_build_custom_provider(secrets):
     assert provider.base_url == "https://custom.example.com/v1"
 
 
+def test_custom_provider_defaults_to_no_reasoning_style(secrets):
+    """无 preset 的自定义 provider（中转站 / MiMo 类网关）不得带厂商私有思考字段。
+
+    OpenAICompatProvider.reasoning_style 的默认值是 thinking_extra_body（DeepSeek 系），
+    若 build_provider 不覆盖它，中转站会收到 {"thinking": {"type": "disabled"}} 而可能 400。
+    """
+    cfg = ProviderConfig(
+        protocol="openai_compat",
+        base_url="https://relay.example.com/v1",
+        api_key_id="ds_key",
+    )
+    provider = build_provider("relay", cfg, secrets, {})
+    assert isinstance(provider, OpenAICompatProvider)
+    assert provider.reasoning_style == "none"
+    assert provider.known_model_ids == set()
+    assert provider.reasoning_model_ids == set()
+
+
+def test_custom_provider_sends_no_thinking_field(secrets):
+    """承上：实际构造出的 extra_body 必须是空的。"""
+    from providers import ReasoningConfig
+
+    cfg = ProviderConfig(
+        protocol="openai_compat",
+        base_url="https://relay.example.com/v1",
+        api_key_id="ds_key",
+    )
+    provider = build_provider("relay", cfg, secrets, {})
+    assert provider._build_reasoning_extra_body(None, model="whatever") == {}
+    assert (
+        provider._build_reasoning_extra_body(
+            ReasoningConfig(enabled=True), model="whatever"
+        )
+        == {}
+    )
+
+
+def test_preset_still_injects_thinking_field(builtin_presets, secrets):
+    """对照组：有 preset 的 DeepSeek 仍应发 thinking 字段，别把功能一起修掉。"""
+    from providers import ReasoningConfig
+
+    cfg = ProviderConfig(preset="deepseek", api_key_id="ds_key")
+    provider = build_provider("ds", cfg, secrets, builtin_presets)
+    assert provider.reasoning_style == "thinking_extra_body"
+    assert provider._build_reasoning_extra_body(
+        ReasoningConfig(enabled=False), model="deepseek-flash"
+    ) == {"thinking": {"type": "disabled"}}
+
+
+def test_config_reasoning_style_overrides_preset(builtin_presets, secrets):
+    """显式配置优先于 preset 默认值（例如用 DeepSeek 预设走中转站）。"""
+    cfg = ProviderConfig(
+        preset="deepseek",
+        base_url="https://relay.example.com/v1",
+        api_key_id="ds_key",
+        reasoning_style="none",
+    )
+    provider = build_provider("relay", cfg, secrets, builtin_presets)
+    assert provider.reasoning_style == "none"
+    # known_model_ids 仍来自 preset（base_url 是覆盖，不是抛弃 preset）
+    assert "deepseek-flash" in provider.known_model_ids
+
+
+def test_config_reasoning_style_rejects_unknown_value():
+    """非法取值由 Literal 拦下，避免拼错后静默退回默认行为。"""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        ProviderConfig(
+            protocol="openai_compat",
+            base_url="https://x.example.com/v1",
+            reasoning_style="thinking_extra_header",  # 文档里写过但未实现的值
+        )
+
+
 def test_build_unknown_preset_raises(secrets):
     cfg = ProviderConfig(preset="totally_unknown", api_key_id="ds_key")
     with pytest.raises(ProviderError, match="未知预设"):

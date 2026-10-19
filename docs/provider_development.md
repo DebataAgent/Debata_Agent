@@ -30,16 +30,13 @@ id: my_platform
 display_name: My Platform
 protocol: openai_compat
 base_url: https://api.myplatform.com/v1
-reasoning_style: none          # none / thinking_extra_body / thinking_extra_header
+reasoning_style: none          # 见下方说明
 
 models:
   - id: my-model-pro
     display_name: My Model Pro
     capabilities: [chat, tool_call, reasoning]
     context_length: 128000
-    pricing:
-      input_per_million: 1.0
-      output_per_million: 2.0
 
 registration_url: https://platform.myplatform.com
 ```
@@ -47,6 +44,40 @@ registration_url: https://platform.myplatform.com
 `capabilities` 选项：`chat` / `tool_call` / `reasoning` / `vision` / `embedding`。
 
 `tests/test_providers_presets.py` 会自动加载校验。
+
+### reasoning_style 的四个取值
+
+| 取值 | 发出的字段 | 适用 |
+|---|---|---|
+| `thinking_extra_body` | `extra_body={"thinking": {"type": "enabled"/"disabled"}}` | DeepSeek / GLM / 小米 MiMo |
+| `qwen_enable_thinking` | `extra_body={"enable_thinking": bool}` | 通义千问 |
+| `openai_native` | 不发 | OpenAI o 系列（隐式启用） |
+| `none` | 不发 | **不认识的中转站** |
+
+映射实现在 `providers/protocols/openai_compat.py::_build_reasoning_extra_body`。
+
+留空时的默认值：有 preset 取 preset 的值；**没有 preset 的自定义 provider 取 `none`**。
+这条默认值很重要——早先的实现会让自定义 provider 落到 `thinking_extra_body`，
+把 `{"thinking": {"type": "disabled"}}` 发给根本不认识这个字段的网关，严格网关直接 400。
+
+### 还有哪些字段没被消费
+
+`pricing` 与 `thinking_extra_header` 在早期文档里出现过，**当前代码不解析它们**。
+写进 preset.yaml 不会报错，但也不会有任何效果——别被示例误导。
+
+---
+
+## 在 WebUI 里自助添加（不用写 preset.yaml）
+
+设置 →「模型」→「添加提供商」：
+
+- 选一个内置预设，或选「自定义 OpenAI / Anthropic 兼容端点」填 Base URL（中转站走这条）
+- 支持「测试连接」（真发一次最小请求）和「获取模型列表」（打 `{base_url}/models`）
+- 每个 provider 可以单独覆盖 `reasoning_style`、`extra_headers`、`timeout_seconds`
+
+想让自己写的预设出现在下拉里，放进数据目录的 `providers/presets/<name>/preset.yaml`
+（`AppPaths.USER_PROVIDER_PRESETS_DIR`），**同名 id 会覆盖内置预设**——
+这样不必去改仓库里的 `providers/presets/`。
 
 ---
 

@@ -61,7 +61,12 @@ IAdapter.send_text() → 用户收到消息
 
 ## KV 缓存友好的 system prompt 结构
 
-`agents/context_builder.build_combined_system_prompt()` 把所有稳定区拼成**单一 system 消息**，内部用 XML 分区：
+> **核心规则（来自 DeepSeek 官方 harness 的 KV Cache 语义）**：provider 的前缀缓存按
+> 「完整匹配的 token 块」命中。**system 里任何一块变了，从该块起（含其后的整段对话
+> 历史）全部失效**。所以 system 必须是纯不可变的，所有易变内容一律追加在历史**之后**。
+> 参考 `deepseek-harness/packages/core/agent-loop/README.md` 的 "KV Cache effect" 一节。
+
+`agents/context_builder.build_combined_system_prompt()` 只拼**不可变**的内容：
 
 ```xml
 <core_rules priority="critical">       — 永不变
@@ -71,10 +76,35 @@ IAdapter.send_text() → 用户收到消息
 <conversation_protocol priority="high">— 永不变
 <self_reflection priority="medium">    — 永不变
 <qq_format priority="reference">       — 永不变
-<long_term_memory priority="medium">   — 重要记忆变化时
 ```
 
-**稳定性递减顺序前置**，确保 LLM 的 KV 缓存命中率最大化。每轮变化的 `task_context`（时间、表情包列表、提示等）作为单独的 user 消息追加到 history 末尾，**不破坏前缀**。
+**易变块一律排在 history 之后**，由 `build_runtime_tail_blocks()` 统一构造，
+**按稳定性递减**排列（越靠后变化时被牵连作废的 token 越少）：
+
+```
+[system]                            不可变骨架
+[system]                            admin_info（有管理员时）
+*history                            append-only，前缀缓存的主体
+[user]  <task_context>              每轮变；必须紧贴 history（见下）
+[user]  <long_term_memory>          事件驱动，且按会话 scope 过滤 → 换会话即变
+[user]  <rolling_conversation_summary>  压缩提交时整段重写
+[user]  <retrieved_conversation_context> 按 query 每轮变
+[user]  user_event
+```
+
+两条容易踩的坑：
+
+1. **`<long_term_memory>` 绝不能放回 system**。它由 `ImportantMemoryManager.text_for_context()`
+   按 conversation scope + 群成员过滤，换个群回复就会变；而 history 是全会话统一时间线
+   （跨会话共享同一前缀），放在历史之前会让**每次换群都作废整段历史**。实测该块在
+   25119/27299/27932 三种大小间跳变时，命中率会从 ~97% 掉到 23%。
+2. **`<task_context>` 必须紧贴 history**。它是唯一会被逐字节写回 history 的块
+   （`metadata.kind=task_context_snapshot`），所以上一轮的 `[... history, task_context]`
+   会整体成为本轮的公共前缀；若在它前面插入别的尾部块，公共前缀会退回到 history 末尾。
+
+`agents/runner._kv_prompt_diagnostics()` 会把 `kv_prefix_stable_hash`（尾块之前的
+可复用前缀哈希）、`kv_system_char_count`、`kv_tail_char_count` 等写进 usage 记录，
+重启后可直接用它判断「这次为什么没命中」。
 
 详见 [KV 缓存基准](kv_cache_benchmark.md) 和 `agents/context_builder.py` 注释。
 
@@ -106,7 +136,42 @@ IAdapter.send_text() → 用户收到消息
 
 `range_start_messages`、`range_end_messages` 以及 `behavior.context` 中旧的“活跃历史保底 / 保留最近 N 条运行时记录”字段已经废弃；主动思考路由器使用独立的 `proactive_router_*` 预算字段，不参与主聊天历史裁剪。
 
+压缩触发/目标按“**模型可见视图 token + 固定 system/tools 开销**”计算，而不是原始活跃历史；默认 `50/30/20`（触发/目标/重试）。模型视图见下一节。
+
 ---
+
+## 模型视图（运行时噪声裁剪）
+
+`core/model_view.py` 在**不修改落盘历史**的前提下，构造一份只给模型看的视图：
+
+- 真实聊天、非 no_action 的工具调用/结果全部保留。
+- `task_context_snapshot`、`send_receipt`、`send_done_snapshot` 各保留最近 N 个（默认 2/2/2）。
+- `no_action` 按完整 assistant tool_call + tool result 成对保留最近 4 组。
+- 超长 user 记录做确定性头尾截断（默认 8,000 字符），原始记录仍在 event store/archive 中。
+- 发送类工具结果投影为 `msg_id/order/status` 等定位字段，不再回显已发送正文。
+
+`PipelineWorkingContextMixin._select_working_history()` 返回视图；`_active_history_records()`
+仍返回原始记录，供摘要、归档、`recall_history` 和 `get_recent_chat_messages` 使用。
+压缩触发与目标统一按“视图 token + 固定 system/tools 开销”计算，避免旧快照触发压缩或
+总结 Agent 重复读取噪声。
+
+配置位于 `behavior.context.model_view`，回滚开关是 `enabled=false`。
+
+## Token 计量
+
+- `utils.token_budget.TokenEstimator` 用规范 JSON 估算 messages 与 tools（不再用 Python repr）。
+- 小文本按 `(model, text)` LRU 缓存；工具 schema 按 registry 列表对象缓存。
+- 每次真实调用记录 `estimated_prompt_tokens`、`prompt_estimate_ratio`、`calib_ratio`。
+- `core/token_calibration.py` 按 `provider|model` 持久化校准系数与 MAPE，启动时恢复。
+- 用量面板展示未命中输入 token 与估算误差；`cached_tokens` 会被 clamp 到 `prompt_tokens`。
+
+## 工具 schema 档位
+
+- `behavior.tool_schema_profile="compact"`（默认）：11 个高频工具直出核心字段；
+  其余工具为 stub，需先 `tool_search`；高级可选字段通过 `tool_search detail=full` 查看。
+- `"full"`：保留旧的 31 个 full schema 行为，用于回滚/排查。
+- `finish_after_success` 已从 schema 移除；执行层兼容旧调用。发送成功后
+  `behavior.auto_finish_after_send=true` 会直接结束本轮，避免额外一次 `no_action` 调用。
 
 ## 工具结果创建即定型
 
@@ -238,8 +303,8 @@ Runtime.shutdown() → 反序关闭
 跑测试：
 
 ```bash
-pip install -e ".[dev,gui]"
-venv/Scripts/python -m pytest tests/ -q --ignore=tests/test_kv_cache_real.py
+uv sync --extra dev
+uv run python -m pytest tests/ -q --ignore=tests/test_kv_cache_real.py
 ```
 
 ---
@@ -251,6 +316,12 @@ venv/Scripts/python -m pytest tests/ -q --ignore=tests/test_kv_cache_real.py
 - **aiofiles** 替代同步文件 IO
 - **JSONL 增量追加**（HistoryManager）替代每次重写整个 JSON
 - **KV 缓存前缀稳定**（context_builder）
+- **模型视图裁剪**（`core/model_view.py`）：旧运行时快照/回执/no_action 不再进入 prompt
+- **工具 schema 分级**（`tools/base.py`）：compact + stub + `tool_search detail=full`
+- **发送成功自动收尾**（`agents/runner.py`）：省掉一次 `no_action` 模型调用
+- **Token 计量**（`utils/token_budget.py` + `core/token_calibration.py`）：规范 JSON、持久化校准、编码缓存
+- **KV 诊断分级**（`agents/runner.py`）：默认 `summary`，不再每轮多次全量序列化
 - **WebSocket 长连接 + 心跳**（NapCatAdapter）
 
+基准脚本：`scripts/benchmark_prompt_tokens.py`（只读，不调用模型）。
 详见 [KV 缓存基准](kv_cache_benchmark.md)。

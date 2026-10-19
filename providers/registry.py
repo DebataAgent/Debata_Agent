@@ -16,15 +16,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
 from app_config.schema import ProviderConfig
 from app_config.secrets import SecretsManager
+from utils.proxy_env import sanitize_no_proxy_env
 
 from .base import IProvider, ProviderError
-from .presets_loader import ProviderPreset, load_all_presets
+from .presets_loader import ProviderPreset, load_all_presets, load_presets_for
 from .protocols import AnthropicProvider, OpenAICompatProvider
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,13 @@ def build_provider(
 ) -> IProvider:
     """根据 ProviderConfig 构造一个 IProvider 实例。"""
 
+    # 协议层用 httpx 建连接池，而 httpx 在**构造客户端时**就展开 NO_PROXY：
+    # 条目里出现带方括号的 IPv6（[::1]，Cherry Studio 等运行时会注入）会拼出非法
+    # pattern all://*[::1]，客户端一构造就抛 InvalidURL。入口脚本（main.py /
+    # webui_server.py）已经清理过一次；这里再兜一层且幂等，保证直接调用本函数
+    # 的场景（pytest、内嵌用法）同样不会被环境变量炸掉。
+    sanitize_no_proxy_env()
+
     # 解析协议、base_url、reasoning_style
     preset: ProviderPreset | None = None
     if cfg.preset:
@@ -112,13 +120,24 @@ def build_provider(
         "extra_headers": dict(cfg.extra_headers),
     }
 
-    # openai_compat 专属参数
-    if protocol == "openai_compat" and preset is not None:
-        kwargs["reasoning_style"] = preset.reasoning_style
-        kwargs["known_model_ids"] = {m.id for m in preset.models}
-        kwargs["reasoning_model_ids"] = {
-            m.id for m in preset.models if "reasoning" in m.capabilities
-        }
+    # openai_compat 专属参数。
+    # 必须无条件传 reasoning_style：OpenAICompatProvider 的默认值是
+    # "thinking_extra_body"，若不覆盖，无 preset 的自定义 provider（中转站 / MiMo 等）
+    # 会把 {"thinking": {"type": "disabled"}} 发给根本不认识这个字段的网关，严格网关直接 400。
+    # 优先级：配置显式指定 > preset 默认 > none（不认识就什么都不发）。
+    if protocol == "openai_compat":
+        if cfg.reasoning_style is not None:
+            kwargs["reasoning_style"] = cfg.reasoning_style
+        elif preset is not None:
+            kwargs["reasoning_style"] = preset.reasoning_style
+        else:
+            kwargs["reasoning_style"] = "none"
+        kwargs["known_model_ids"] = {m.id for m in preset.models} if preset else set()
+        kwargs["reasoning_model_ids"] = (
+            {m.id for m in preset.models if "reasoning" in m.capabilities}
+            if preset
+            else set()
+        )
 
     return factory(**kwargs)
 
@@ -135,8 +154,12 @@ class ProviderRegistry:
         self._providers: dict[str, IProvider] = {}
         self._presets: dict[str, ProviderPreset] = {}
 
-    def load_presets(self, presets_dir: Path) -> None:
-        self._presets = load_all_presets(presets_dir)
+    def load_presets(self, presets_dir: Path, *, extra_dirs: Sequence[Path] = ()) -> None:
+        self._presets = load_all_presets(presets_dir, extra_dirs=extra_dirs)
+
+    def load_presets_for(self, paths: Any) -> None:
+        """按 AppPaths 加载内置 + 用户自定义预设（推荐的调用方式）。"""
+        self._presets = load_presets_for(paths)
 
     @property
     def presets(self) -> dict[str, ProviderPreset]:

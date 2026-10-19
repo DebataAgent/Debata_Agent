@@ -1,24 +1,33 @@
-"""上下文消息组装 —— 稳定 system + 尾部运行时上下文。
+"""上下文消息组装 —— 纯不可变 system + append-only 历史 + 稳定性递减的尾部块。
 
-设计原则（基于 Anthropic Context Engineering 调研结论）：
-    1. 单一 system 消息：把 identity / persona / tools / memory 拼到同一个 system
-       里，用 XML 标签分区。比"多个 system 消息平铺"更友好（KV 缓存命中率更高，
-       模型对标签边界理解更稳定）。
-    2. 稳定区前置：identity > persona > tool_use_protocol > memory，按稳定性递减
-       排列，确保前缀稳定，最大化 KV 缓存命中。
-    3. task_context 末尾插入：当前时间、表情包列表、本轮提示等"每次都不同"的内容，
-       通过单独的 user 运行时上下文消息追加到 history 之后。这样改动只影响尾部
-       token，不破坏前缀缓存，也避开部分 OpenAI-compatible provider 对尾部动态
-       system 消息的缓存劣化。
+设计原则（基于 DeepSeek 官方 harness 的 KV Cache 规则，见
+`deepseek-harness/packages/core/agent-loop/README.md` 的 "KV Cache effect" 一节）：
+
+    1. **system 只放永不变的内容**。provider 的前缀缓存按「完整匹配的 token 块」
+       命中；一旦 system 里任何一块变了，从该块起（含其后的整段对话历史）全部
+       失效。所以 system 里绝不能出现按会话/按轮次变化的内容。
+    2. **history 之后才是易变块**，并按「稳定性递减」排列：越靠后的块变化时，
+       被牵连作废的 token 越少，而它前面的历史始终可复用。这正是 DeepSeek harness
+       的 `systemPromptUpdate: 'in-history'` 语义 —— 把变化追加在已缓存历史之后。
+    3. **`current_context_record` 必须紧贴 history**：该块每轮会被逐字节写回
+       history（metadata.kind=task_context_snapshot），所以上一轮的
+       `[... history, context_record]` 会整体成为本轮的公共前缀。若在它前面插入
+       别的尾部块，公共前缀会退回到 history 末尾，白白丢掉一整轮。
     4. priority 标签辅助：每个分区显式标 priority="critical|high|medium|reference"，
        让模型在冲突时有明确的排序。
 
 结构（拼装后实际格式）：
     [
-      {"role": "system", "content": "<core_rules>...</core_rules>\n<persona>...</persona>\n<tools>...</tools>\n<memory>...</memory>"},
-      {"role": "system", "content": "<admin_info>...</admin_info>"},  # 仅在有 admin 时
-      *history,                                                          # 来自 HistoryManager
-      {"role": "user", "content": "<task_context>...</task_context>"}  # 本轮 ephemeral
+      # ---- 不可变区：内容只随人格/工具集变化，不随轮次变化 ----
+      {"role": "system", "content": "<core_rules>...<persona>...<tools>..."},
+      {"role": "system", "content": "<admin_info>...</admin_info>"},   # 仅在有 admin 时
+      # ---- append-only 区 ----
+      *history,                                        # 来自 HistoryManager
+      # ---- 尾部易变区：稳定性递减 ----
+      {"role": "user", "content": "<task_context>..."},          # 每轮变（会被写回 history）
+      {"role": "user", "content": "<long_term_memory>..."},      # 事件驱动 + 按会话 scope
+      {"role": "user", "content": "<rolling_conversation_summary>..."},  # 压缩提交时整段重写
+      {"role": "user", "content": "<retrieved_conversation_context>..."},  # 按 query 每轮变
     ]
 """
 
@@ -57,32 +66,34 @@ class ContextRequest:
 
 def build_combined_system_prompt(
     persona: Persona,
-    important_memory_text: str = "",
     *,
     memory_mode: Literal["file", "rag"] = "file",
     eat_tool: bool = False,
     sleep_tool: bool = False,
 ) -> str:
-    """组装稳定区（identity + persona + tools + memory）为单一 system 字符串。
+    """组装**不可变** system 前缀（identity + persona + tools + 场景协议）。
+
+    返回的字符串对给定的 (persona, memory_mode, eat_tool, sleep_tool) 是常量，
+    不随会话、轮次、时间、记忆内容变化 —— 这是前缀缓存能命中的前提。
 
     Args:
         persona: 已加载的人格
-        important_memory_text: 已按当前会话 scope 选出的重要记忆文本。
-            这始终来自 ImportantMemoryManager，不受 RAG 开关影响。
         memory_mode: "file" = 文件模式（默认）；"rag" = 自动会话向量检索。
-            这里只影响工具协议说明，不决定 important_memory_text 是否注入。
+            只影响工具协议说明的写法。
         eat_tool: 本轮工具列表是否提供 eat。
         sleep_tool: 本轮工具列表是否提供 sleep。
 
-    稳定性递减顺序：
-        critical: core_rules（永不变）
-        high:     persona（人格切换时才变）
-        high:     human_chat_patterns（真人聊天形态，永不变）
-        high:     tool_use_protocol（工具集变化时才变；按 memory_mode 拼装）
-        high:     conversation_protocol（场景规则）
+    各段顺序（内容本身不变，顺序仅影响模型阅读）：
+        critical:  core_rules（永不变）
+        high:      persona（人格切换时才变）
+        high:      human_chat_patterns（真人聊天形态，永不变）
+        high:      tool_use_protocol（工具集变化时才变；按 memory_mode 拼装）
+        high:      conversation_protocol（场景规则）
+        medium:    self_reflection（行为约束）
         reference: qq_format（格式参考，不变）
-        medium:   self_reflection（行为约束）
-        medium:   memory（重要记忆，变化时整体替换）
+
+    注意：**重要记忆不在这里**。它按会话 scope 过滤，换个会话就会变；放在 system
+    里会让其后整段对话历史的前缀缓存全部失效。`build_messages` 把它作为尾部块追加。
     """
     parts: list[str] = []
 
@@ -114,15 +125,6 @@ def build_combined_system_prompt(
 
     # 7. QQ 格式参考（最末，方便模型查询）
     parts.append(QQ_FORMAT_REFERENCE.strip())
-
-    # 8. 重要记忆（较稳定，可留在 system 前缀）。RAG 召回每轮按 query 变化，
-    # 不能放在稳定前缀；build_messages 会把它作为尾部运行时上下文追加。
-    if important_memory_text:
-        parts.append(
-            f'<long_term_memory priority="medium">\n'
-            f"{important_memory_text.strip()}\n"
-            f"</long_term_memory>"
-        )
 
     return "\n\n".join(parts)
 
@@ -167,6 +169,107 @@ def build_task_context(
         return ""
     content = "\n\n".join([RUNTIME_CONTEXT_NOTICE, *parts])
     return f'<task_context priority="medium">\n{content}\n</task_context>'
+
+
+TAIL_BLOCK_MARKERS: tuple[str, ...] = (
+    "<task_context",
+    "<long_term_memory",
+    "<rolling_conversation_summary",
+    "<retrieved_conversation_context",
+)
+"""尾部易变块的 XML 开标签。顺序即稳定性递减顺序（易变的在前）。
+
+`first_tail_block_index` 与 KV 诊断用它来切出「本轮可复用的稳定前缀」。
+"""
+
+
+def build_runtime_tail_blocks(
+    *,
+    important_memory_text: str = "",
+    rolling_summary_text: str = "",
+    rag_context_text: str = "",
+) -> list[dict[str, Any]]:
+    """构造 `task_context` 之后的尾部易变块。
+
+    **这是尾部块内容与顺序的唯一事实来源** —— `build_messages`、KV 诊断与回归测试
+    都从这里取，避免以后有人把易变块插回 system 前缀里（那会让其后整段历史失效）。
+
+    顺序按「稳定性递减」排列，越靠后变化时牵连作废的 token 越少：
+
+        1. `<long_term_memory>`  事件驱动；但按会话 scope 过滤，换会话即变
+        2. `<rolling_conversation_summary>`  压缩提交时整段重写
+        3. `<retrieved_conversation_context>`  按 query 每轮变
+
+    全部用 `role="user"` 并带 `RUNTIME_CONTEXT_NOTICE`，与 RAG 块既有风格一致；
+    用 user 而非 system 还因为 Anthropic 协议会把 system 消息上提到顶层
+    `system` 参数，那样这些块就失去「在历史之后」的位置语义了。
+    """
+    blocks: list[dict[str, Any]] = []
+
+    if important_memory_text:
+        blocks.append(
+            {
+                "role": "user",
+                "content": (
+                    '<long_term_memory priority="medium">\n'
+                    f"{RUNTIME_CONTEXT_NOTICE}\n"
+                    "以下是系统保存的长期重要记忆，不是用户新发言。\n"
+                    f"{important_memory_text.strip()}\n"
+                    "</long_term_memory>"
+                ),
+            }
+        )
+
+    if rolling_summary_text:
+        blocks.append(
+            {
+                "role": "user",
+                "content": (
+                    '<rolling_conversation_summary priority="medium">\n'
+                    f"{RUNTIME_CONTEXT_NOTICE}\n"
+                    "以下是更早对话的滚动摘要，不是用户新发言。\n"
+                    f"{rolling_summary_text.strip()}\n"
+                    "</rolling_conversation_summary>"
+                ),
+            }
+        )
+
+    if rag_context_text:
+        blocks.append(
+            {
+                "role": "user",
+                "content": (
+                    '<retrieved_conversation_context priority="medium" source="rag">\n'
+                    f"{RUNTIME_CONTEXT_NOTICE}\n"
+                    "以下内容是系统从历史对话向量索引中检索到的相关片段，不是模型主动保存的记忆，也不代表新的用户消息。\n"
+                    f"{rag_context_text.strip()}\n"
+                    "</retrieved_conversation_context>"
+                ),
+            }
+        )
+
+    return blocks
+
+
+def first_tail_block_index(messages: list[dict[str, Any]]) -> int:
+    """返回**末尾连续尾部块区段**的起点下标；没有则返回 len(messages)。
+
+    `messages[:idx]` 即「本轮可复用的稳定前缀」—— 只要 system、工具集与历史保持
+    append-only，这段前缀就能命中 provider 的前缀缓存。
+
+    必须从后往前扫：历史里本来就存着往轮的 `task_context_snapshot` 记录
+    （metadata.kind=task_context_snapshot），从前往后会命中最老的那条，
+    把整个历史误判成尾部块。
+    """
+    idx = len(messages)
+    while idx > 0:
+        content = messages[idx - 1].get("content")
+        if not isinstance(content, str):
+            break
+        if not any(marker in content for marker in TAIL_BLOCK_MARKERS):
+            break
+        idx -= 1
+    return idx
 
 
 def _provider_safe_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -291,7 +394,6 @@ def build_messages(
 
     system_content = build_combined_system_prompt(
         persona,
-        important_memory_text,
         memory_mode=memory_mode,
         eat_tool=eat_tool,
         sleep_tool=sleep_tool,
@@ -302,20 +404,11 @@ def build_messages(
     if admin_info:
         messages.append({"role": "system", "content": admin_info})
 
-    if rolling_summary_text:
-        messages.append(
-            {
-                "role": "system",
-                "content": (
-                    '<rolling_conversation_summary priority="medium">\n'
-                    f"{rolling_summary_text.strip()}\n"
-                    "</rolling_conversation_summary>"
-                ),
-            }
-        )
-
     messages.extend(_provider_safe_history(history))
 
+    # ---- 尾部易变区：稳定性递减，任何一块变化都只影响它之后的 token ----
+    # task_context 必须紧贴 history：它是唯一会被逐字节写回 history 的块，
+    # 所以上一轮的 [... history, task_context] 会整体成为本轮的公共前缀。
     if current_context_record is not None:
         content = str(current_context_record.get("content") or "")
         if content:
@@ -333,19 +426,13 @@ def build_messages(
         if task_ctx:
             messages.append({"role": "user", "content": task_ctx})
 
-    if rag_context_text:
-        messages.append(
-            {
-                "role": "user",
-                "content": (
-                    '<retrieved_conversation_context priority="medium" source="rag">\n'
-                    f"{RUNTIME_CONTEXT_NOTICE}\n"
-                    "以下内容是系统从历史对话向量索引中检索到的相关片段，不是模型主动保存的记忆，也不代表新的用户消息。\n"
-                    f"{rag_context_text.strip()}\n"
-                    "</retrieved_conversation_context>"
-                ),
-            }
+    messages.extend(
+        build_runtime_tail_blocks(
+            important_memory_text=important_memory_text,
+            rolling_summary_text=rolling_summary_text,
+            rag_context_text=rag_context_text,
         )
+    )
 
     if user_event:
         messages.append({"role": "user", "content": user_event.strip()})

@@ -284,6 +284,10 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
         result = await executor(name, args)
         results[name] = result
         assert isinstance(result, dict), name
+        if name == "no_action":
+            # no_action 使用极简结果，避免每轮沉默都带协议字段。
+            assert result == {"ok": True, "no_action": True}
+            continue
         _assert_tool_result_envelope(result, name)
         assert "ok" in result, name
         if result.get("ok"):
@@ -323,8 +327,7 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
     assert agent_tasks[0]["sources"][0]["type"] == "inline_text"
     assert agent_tasks[0]["max_loops"] == 5
 
-    assert results["no_action"]["no_action"] is True
-    assert results["no_action"]["brief"] == "本轮不执行操作。"
+    assert results["no_action"] == {"ok": True, "no_action": True}
     assert results["schedule_wakeup"]["scheduled"] is True
     assert wakeups[0]["delay_seconds"] == 1
     assert wakeups[0]["target"] == {"target_type": "private", "target_id": 123}
@@ -344,10 +347,10 @@ async def test_all_tools_have_clear_results_in_simulated_runtime(tmp_path):
     for name in (
         "send_private_messages",
         "send_group_message",
-        "no_action",
         "commit_send_attempt",
     ):
         _assert_tool_result_envelope(results[name], name)
+    assert results["no_action"] == {"ok": True, "no_action": True}
     non_commit_sends = [
         item for item in sent_actions if item["source_tool"] != "commit_send_attempt"
     ]

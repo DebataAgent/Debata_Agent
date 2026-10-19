@@ -865,7 +865,9 @@ async def test_runtime_provider_health_check_does_not_block_start(
     rt = Runtime(project_root=project_root)
 
     try:
-        await asyncio.wait_for(rt.start(), timeout=1.0)
+        # 低功耗 ARM 设备首次启动可能生成 RSA 密钥，1 秒过于紧张；
+        # 这里只验证 start() 不等待健康检查，超时放宽到 10 秒。
+        await asyncio.wait_for(rt.start(), timeout=10.0)
         await asyncio.wait_for(started.wait(), timeout=1.0)
         assert rt._provider_health_task is not None
         assert not rt._provider_health_task.done()

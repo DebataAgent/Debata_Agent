@@ -1,12 +1,19 @@
 """Debata_Agent 程序入口。
 
+默认启动 **WebUI**（浏览器控制台，监听 0.0.0.0 供局域网访问）。
+原 PySide6 桌面端已移除，`ui/` 目录与 `gui` 依赖不再存在。
+
 启动顺序：
-    1. 解析命令行参数（--no-gui / --config 路径等）
+    1. 解析命令行参数
     2. 配置 logging（按 config.app.log_level）
     3. 安装高性能事件循环（Linux/Mac 上用 uvloop）
-    4. 检测配置是否就绪 → 否则启动配置向导
-    5. 实例化 Runtime → 启动 → 等待 stop
-    6. 如启用 GUI 则把 tray 跑在 qasync 桥接的事件循环里
+    4. 按模式分流：
+         - 默认        → WebUI（webui/server.py）
+         - --no-gui    → 纯命令行 Runtime（无任何界面）
+         - --setup 等  → CLI 配置向导 / 专项维护命令
+
+WebUI 首次启动时若发现没有 config.yaml，会在浏览器里给出配置向导；
+纯命令行模式则会走 ``main_cli`` 的交互式向导。
 """
 
 from __future__ import annotations
@@ -18,205 +25,35 @@ import sys
 from getpass import getpass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any
 
 import main_cli as _main_cli
+from utils.proxy_env import sanitize_no_proxy_env
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_WEBUI_HOST = "0.0.0.0"
+DEFAULT_WEBUI_PORT = 8000
 
-def _gui_instance_lock_path(paths: Any) -> Path:
-    """返回当前数据实例的 GUI 单实例锁文件。"""
-    return paths.INSTANCE_DIR / "debata.gui.lock"
-
-
-def _acquire_gui_instance_lock(lock_path: Path) -> Any | None:
-    """尝试获取 GUI 单实例锁；失败表示该数据实例已有 GUI 在运行。"""
-    from PySide6.QtCore import QLockFile
-
-    lock = QLockFile(str(lock_path))
-    if lock.tryLock(100):
-        return lock
-    return None
-
-
-def _notify_gui_instance_running(lock_path: Path) -> None:
-    """提示用户已有实例运行；避免为了提示再启动完整 Qt 应用。"""
-    message = f"Debata_Agent 已有一个 GUI 实例在运行。\n\n实例锁：{lock_path}"
-    if sys.platform == "win32":
-        try:
-            import ctypes
-
-            ctypes.windll.user32.MessageBoxW(None, message, "Debata_Agent", 0x40)
-            return
-        except Exception:
-            pass
-    print(message, file=sys.stderr)
+# 这些子命令交给 service_cli 处理，避免和正常启动参数混在一起。
+_SERVICE_COMMANDS = frozenset(
+    {
+        "start",
+        "stop",
+        "restart",
+        "status",
+        "log",
+        "enable",
+        "disable",
+        "install",
+        "uninstall",
+        "help",
+    }
+)
 
 
-def _install_qasync_timer_multiplexer(qasync_module: Any) -> None:
-    """把 qasync 的每回调一个 Qt timer 改成单 Qt timer 多路复用。
-
-    qasync 默认会把每个 asyncio.call_later/asyncio.sleep 映射成一个
-    QObject.startTimer()。业务里存在大量延时任务时，Windows 会先打到
-    Qt 原生 timer 上限并刷 registerTimer 失败。这里保留 qasync 接口，
-    但内部只持有一个 QTimer。
-    """
-    if getattr(qasync_module, "_debata_timer_multiplexer_installed", False):
-        return
-    if not hasattr(qasync_module, "_SimpleTimer"):
-        logger.warning("qasync 未暴露 _SimpleTimer，跳过 timer 多路复用补丁")
-        return
-
-    import heapq
-    import itertools
-    import math
-    import time as _time
-
-    from PySide6 import QtCore
-
-    class _MultiplexTimer(QtCore.QObject):
-        _MAX_NATIVE_TIMER_MS = 60_000
-        _COMPACT_CANCELLED_THRESHOLD = 100
-        _COMPACT_HEAP_RATIO = 2
-
-        def __init__(self) -> None:
-            super().__init__()
-            self.__callbacks: dict[int, Any] = {}
-            self.__heap: list[tuple[float, int, int]] = []
-            self.__seq = itertools.count()
-            self.__ids = itertools.count(1)
-            self.__stopped = False
-            self.__debug_enabled = False
-            self.__cancelled_since_compact = 0
-            self.__next_compact_scan_at = self._COMPACT_CANCELLED_THRESHOLD * 2
-            self.__timer = QtCore.QTimer(self)
-            self.__timer.setSingleShot(True)
-            self.__timer.timeout.connect(self.__run_due)
-            self._logger = logging.getLogger(f"{qasync_module.__name__}._SimpleTimer")
-
-        def add_callback(self, handle: Any, delay: float = 0) -> Any:
-            if self.__stopped:
-                return handle
-            callback_id = next(self.__ids)
-            deadline = _time.monotonic() + max(0.0, float(delay))
-            self.__callbacks[callback_id] = handle
-            heapq.heappush(self.__heap, (deadline, next(self.__seq), callback_id))
-            self.__schedule_next()
-            return handle
-
-        def stop(self) -> None:
-            self.__log_debug("Stopping timers")
-            self.__stopped = True
-            self.__timer.stop()
-            self.__callbacks.clear()
-            self.__heap.clear()
-
-        def set_debug(self, enabled: bool) -> None:
-            self.__debug_enabled = enabled
-
-        def __discard_cancelled_head(self) -> None:
-            while self.__heap:
-                _deadline, _seq, callback_id = self.__heap[0]
-                handle = self.__callbacks.get(callback_id)
-                if handle is None:
-                    heapq.heappop(self.__heap)
-                    continue
-                if getattr(handle, "_cancelled", False):
-                    self.__log_debug("Handle %s cancelled", handle)
-                    heapq.heappop(self.__heap)
-                    self.__callbacks.pop(callback_id, None)
-                    self.__cancelled_since_compact += 1
-                    continue
-                break
-
-        def __compact_heap_if_needed(self) -> None:
-            should_scan = (
-                self.__cancelled_since_compact >= self._COMPACT_CANCELLED_THRESHOLD
-                or len(self.__heap) >= self.__next_compact_scan_at
-            )
-            if not should_scan:
-                return
-            active_heap = [
-                item
-                for item in self.__heap
-                if (handle := self.__callbacks.get(item[2])) is not None
-                and not getattr(handle, "_cancelled", False)
-            ]
-            if len(self.__heap) <= len(active_heap) * self._COMPACT_HEAP_RATIO:
-                self.__cancelled_since_compact = 0
-                self.__next_compact_scan_at = max(
-                    len(self.__heap) * 2,
-                    self._COMPACT_CANCELLED_THRESHOLD * 2,
-                )
-                return
-            self.__heap = active_heap
-            heapq.heapify(self.__heap)
-            self.__callbacks = {callback_id: self.__callbacks[callback_id] for _, _, callback_id in self.__heap}
-            self.__cancelled_since_compact = 0
-            self.__next_compact_scan_at = max(
-                len(self.__heap) * 2,
-                self._COMPACT_CANCELLED_THRESHOLD * 2,
-            )
-
-        def __schedule_next(self) -> None:
-            if self.__stopped:
-                return
-            self.__discard_cancelled_head()
-            self.__compact_heap_if_needed()
-            if not self.__heap:
-                self.__timer.stop()
-                return
-            deadline, _seq, _callback_id = self.__heap[0]
-            delay_ms = max(0, math.ceil((deadline - _time.monotonic()) * 1000))
-            self.__timer.start(min(delay_ms, self._MAX_NATIVE_TIMER_MS))
-
-        def __run_due(self) -> None:
-            if self.__stopped:
-                return
-            now = _time.monotonic()
-            due: list[tuple[float, int, int]] = []
-            while self.__heap and self.__heap[0][0] <= now:
-                due.append(heapq.heappop(self.__heap))
-            for _deadline, _seq, callback_id in due:
-                handle = self.__callbacks.pop(callback_id, None)
-                if handle is None or getattr(handle, "_cancelled", False):
-                    self.__cancelled_since_compact += 1
-                    continue
-                if self.__debug_enabled:
-                    loop = asyncio.get_event_loop()
-                    try:
-                        loop._current_handle = handle
-                        self._logger.debug("Calling handle %s", handle)
-                        started_at = _time.time()
-                        handle._run()
-                        duration = _time.time() - started_at
-                        if duration >= loop.slow_callback_duration:
-                            self._logger.warning(
-                                "Executing %s took %.3f seconds",
-                                self.__format_handle(handle),
-                                duration,
-                            )
-                    finally:
-                        loop._current_handle = None
-                else:
-                    handle._run()
-            self.__schedule_next()
-
-        def __log_debug(self, *args: Any, **kwargs: Any) -> None:
-            if self.__debug_enabled:
-                self._logger.debug(*args, **kwargs)
-
-        @staticmethod
-        def __format_handle(handle: asyncio.Handle) -> str:
-            callback = getattr(handle, "_callback", None)
-            if isinstance(getattr(callback, "__self__", None), asyncio.tasks.Task):
-                return repr(callback.__self__)
-            return str(handle)
-
-    qasync_module._SimpleTimer = _MultiplexTimer
-    qasync_module._debata_timer_multiplexer_installed = True
-    logger.info("已启用 qasync timer 多路复用补丁")
+# ============================================================
+# 日志与事件循环
+# ============================================================
 
 
 def setup_logging(
@@ -250,7 +87,7 @@ def setup_logging(
         handlers=[console, file_handler],
         force=True,
     )
-    for noisy_logger in ("qasync", "websockets"):
+    for noisy_logger in ("websockets", "uvicorn.access"):
         logging.getLogger(noisy_logger).setLevel(logging.INFO)
 
 
@@ -260,20 +97,48 @@ def install_uvloop() -> None:
         return
     try:
         import uvloop  # type: ignore
+
         uvloop.install()
         logging.getLogger(__name__).info("已启用 uvloop")
     except ImportError:
         pass
 
 
-def parse_args() -> argparse.Namespace:
+# ============================================================
+# 参数
+# ============================================================
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="debata", description="Debata_Agent —— 让虚拟角色活过来的通用框架"
+        prog="debata",
+        description="Debata_Agent —— 让虚拟角色活过来的通用框架（默认启动 WebUI）",
     )
     parser.add_argument(
         "--no-gui",
         action="store_true",
-        help="纯命令行模式，不启动 PySide6 GUI",
+        help="纯命令行模式：只跑 Runtime，不启动 WebUI（服务器/容器里想完全无界面时用）",
+    )
+    parser.add_argument(
+        "--host",
+        default=DEFAULT_WEBUI_HOST,
+        help=f"WebUI 监听地址（默认 {DEFAULT_WEBUI_HOST}，局域网可访问；只给本机用可填 127.0.0.1）",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_WEBUI_PORT,
+        help=f"WebUI 监听端口（默认 {DEFAULT_WEBUI_PORT}）",
+    )
+    parser.add_argument(
+        "--token",
+        default="",
+        help="WebUI 访问令牌（默认自动生成并记住；想固定一个就填这里）",
+    )
+    parser.add_argument(
+        "--no-auth",
+        action="store_true",
+        help="关闭 WebUI 令牌鉴权。⚠ 能访问该端口的设备都能看聊天记录、改配置，仅限完全可信内网",
     )
     parser.add_argument(
         "--config",
@@ -284,7 +149,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--setup",
         action="store_true",
-        help="强制运行首次配置向导（即使已有 config.yaml）",
+        help="强制运行 CLI 配置向导（即使已有 config.yaml）",
     )
     parser.add_argument(
         "--napcat",
@@ -301,11 +166,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="列出 secrets.enc 中存储的所有密钥 ID（不显示值）",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
+
+
+# ============================================================
+# 纯命令行 Runtime
+# ============================================================
 
 
 async def run_headless(project_root: Path, config_file: Path | None = None) -> None:
-    """无 GUI 模式：直接跑 Runtime。"""
+    """无界面模式：直接跑 Runtime。"""
     from core import Runtime
 
     rt = Runtime(project_root=project_root, config_file=config_file)
@@ -316,344 +186,24 @@ async def run_headless(project_root: Path, config_file: Path | None = None) -> N
         await rt.shutdown()
 
 
-def _find_missing_secrets(cfg, secrets) -> list[str]:
-    """检查 cfg 引用的所有 *_key_id / access_token_id 是否在 secrets 中存在。
-
-    返回缺失项的人类可读描述列表（如 'providers.deepseek_main.api_key_id=deepseek_main'）。
-    """
-    missing: list[str] = []
-    # providers
-    for pid, p in (cfg.providers or {}).items():
-        if p.api_key_id and secrets.get(p.api_key_id) is None:
-            missing.append(f"providers.{pid}.api_key_id = '{p.api_key_id}'")
-    # adapters
-    for aid, a in (cfg.adapters or {}).items():
-        tok_id = getattr(a, "access_token_id", None)
-        if tok_id and secrets.get(tok_id) is None:
-            missing.append(f"adapters.{aid}.access_token_id = '{tok_id}'")
-    # features
-    for fname in ("vision", "asr", "tts", "weather", "embedding"):
-        feat = getattr(cfg.features, fname, None)
-        if feat is None or not getattr(feat, "enabled", False):
-            continue
-        kid = getattr(feat, "api_key_id", None)
-        if kid and secrets.get(kid) is None:
-            missing.append(f"features.{fname}.api_key_id = '{kid}'")
-    return missing
-
-
-def run_with_gui(project_root: Path, force_wizard: bool = False, config_file: Path | None = None) -> None:
-    """GUI 模式统一入口：qasync 桥接 + 向导 / 仪表盘 + 系统托盘 + graceful shutdown。
-
-    - 没有 config 或 force_wizard=True：先弹向导，完成后接力启动 Runtime + Dashboard
-    - 已有 config：直接启动 Runtime + Dashboard
-    - Dashboard 在 Runtime.start() 完成后才创建（避免 page 访问空 runtime 崩溃）
-
-    Windows 上 Ctrl+C 不能通过 add_signal_handler 捕获，
-    用 signal.signal(SIGINT) 设个标志位，再用 QTimer 轮询。
-    """
-    import asyncio as _asyncio
-    import signal as _signal
-    from pathlib import Path
-
-    from app_config import AppPaths, SecretsManager, initialize_runtime_data
-
-    paths = AppPaths(project_root=project_root, config_file=config_file)
-    paths.ensure_data_dirs()
-    initialize_runtime_data(paths, project_root=project_root)
-
-    lock_path = _gui_instance_lock_path(paths)
-    instance_lock = _acquire_gui_instance_lock(lock_path)
-    if instance_lock is None:
-        logger.warning("已有 Debata GUI 实例在运行，拒绝重复启动：%s", lock_path)
-        _notify_gui_instance_running(lock_path)
-        return
-
-    import qasync  # type: ignore
-    from PySide6.QtCore import QTimer
-    from PySide6.QtGui import QIcon
-    from PySide6.QtWidgets import QApplication
-
-    _install_qasync_timer_multiplexer(qasync)
-
-    from core import Runtime
-    from ui.dashboard.main_window import DashboardWindow
-    from ui.theme import cached_qss, palette_for_theme
-    from ui.tray import Tray
-    from ui.wizard.window import WizardWindow
-
-    app = QApplication.instance() or QApplication(sys.argv)
-    app.setQuitOnLastWindowClosed(False)
-    app.setStyleSheet(cached_qss(palette_for_theme("auto")))
-
-    _icon_path = Path(__file__).parent / "ui" / "icon.png"
-    if _icon_path.exists():
-        app.setWindowIcon(QIcon(str(_icon_path)))
-        # Windows：让任务栏显示自定义图标而不是 python.exe 默认图标
-        if sys.platform == "win32":
-            import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("debata.agent")
-
-    loop = qasync.QEventLoop(app)
-    _asyncio.set_event_loop(loop)
-
-    state: dict = {
-        "rt": None,
-        "dashboard": None,
-        "tray": None,
-        "wizard": None,
-        "shutting_down": False,
-    }
-
-    def begin_shutdown() -> None:
-        if state["shutting_down"]:
-            return
-        state["shutting_down"] = True
-        logger.info("准备退出 Debata...")
-        rt = state["rt"]
-        if rt is not None:
-            try:
-                rt.request_stop()
-            except Exception:
-                pass
-        if state["tray"]:
-            state["tray"].hide()
-        if state["dashboard"]:
-            state["dashboard"].close()
-        if state["wizard"]:
-            try:
-                state["wizard"]._completed_emitted = True
-            except Exception:
-                pass
-            state["wizard"].close()
-
-        async def _do_shutdown() -> None:
-            rt = state["rt"]
-            if rt is not None:
-                try:
-                    await asyncio.wait_for(rt.shutdown(), timeout=20.0)
-                except asyncio.TimeoutError:
-                    logger.warning("Shutdown 超时，继续退出")
-                except Exception:
-                    logger.exception("Shutdown 失败")
-            QTimer.singleShot(300, app.quit)
-
-        loop.create_task(_do_shutdown())
-
-    def start_dashboard() -> None:
-        """Runtime + Dashboard + Tray 一站式启动。
-
-        Runtime 启动成功后才创建 Dashboard，避免 page 访问空 runtime。
-        """
-        # 关掉向导窗口（如果还在）
-        if state["wizard"] is not None:
-            try:
-                state["wizard"].close()
-            except Exception as e:
-                logger.warning(f"关闭向导窗口异常: {e}")
-            state["wizard"] = None
-
-        rt = Runtime(project_root=project_root, config_file=config_file)
-        state["rt"] = rt
-
-        async def _boot() -> None:
-            try:
-                await rt.start()
-            except Exception as e:
-                logger.exception("Runtime 启动失败")
-                from PySide6.QtWidgets import QMessageBox
-                QMessageBox.critical(
-                    None,
-                    "未能启动",
-                    f"Runtime 启动失败：\n{e}\n\n请检查配置或日志后重试。",
-                )
-                begin_shutdown()
-                return
-
-            # ---- Runtime 已就绪：现在才创建 Dashboard ----
-            dashboard = DashboardWindow(rt)
-            state["dashboard"] = dashboard
-            dashboard.quit_requested.connect(begin_shutdown)
-
-            def _open_dashboard() -> None:
-                dashboard.show()
-                dashboard.raise_()
-                dashboard.activateWindow()
-
-            def _on_restart() -> None:
-                async def _restart_async() -> None:
-                    ok = False
-                    message = ""
-                    try:
-                        rt.request_stop()
-                        await rt.shutdown()
-                    except Exception:
-                        logger.exception("重启时 shutdown 失败")
-                        message = "停止 Runtime 时失败，请查看日志。"
-                    try:
-                        await rt.start()
-                        ok = True
-                    except Exception:
-                        logger.exception("重启时 start 失败")
-                        message = "启动 Runtime 时失败，请查看日志。"
-                    try:
-                        dashboard.notify_runtime_restart_finished(ok, message)
-                    except Exception:
-                        logger.exception("通知重启结果失败")
-                loop.create_task(_restart_async())
-
-            # 设置页 / 托盘都能触发重启
-            dashboard.restart_requested.connect(_on_restart)
-
-            tray = Tray(
-                on_open=_open_dashboard,
-                on_quit=begin_shutdown,
-                on_restart=_on_restart,
-                runtime_provider=lambda: state["rt"],
-            )
-            state["tray"] = tray
-            tray.show()
-            tray.showMessage(
-                "Debata_Agent",
-                "已在托盘待命。点托盘图标打开仪表盘。",
-                msecs=2500,
-            )
-            _open_dashboard()
-
-        loop.create_task(_boot())
-
-    def _safe_initialize_secrets(sm: SecretsManager) -> bool:
-        """initialize 失败（一般是换环境或 keyring 损坏）时弹窗让用户选择清空重做。
-
-        返回 True 表示 sm 已 initialize 成功，可继续；False 表示用户选退出。
-        """
-        from app_config.secrets import SecretsError
-        from ui.widgets import show_message
-        try:
-            sm.initialize()
-            return True
-        except SecretsError as e:
-            logger.warning(f"密钥初始化失败：{e}")
-            if show_message(
-                None,
-                "密钥解密失败",
-                f"无法用当前 keyring 中的 RSA 私钥解开 AES 主密钥：\n\n{e}\n\n"
-                "常见原因：换了机器 / 重装系统 / 更换 Windows 用户 / keyring 数据丢失。\n\n"
-                "选择「清空重做」会删掉旧的 secrets 文件和 keyring 里的 RSA 私钥，"
-                "重新生成一对全新的密钥并进入向导（你需要重新填 API key 等密钥）。"
-                "yaml 配置不会被动到。",
-                confirm_text="清空重做",
-                cancel_text="退出",
-                is_danger=True,
-            ):
-                sm.reset_all()
-                try:
-                    sm.initialize()
-                    return True
-                except Exception as e2:  # noqa: BLE001
-                    show_message(
-                        None, "重置后仍失败",
-                        f"重置后再次 initialize 还是失败：{e2}\n\n请联系开发者。",
-                        confirm_text="退出",
-                    )
-                    return False
-            return False
-
-    def _enter_wizard() -> None:
-        secrets = SecretsManager(paths)
-        if not _safe_initialize_secrets(secrets):
-            begin_shutdown()
-            return
-        wizard = WizardWindow(paths, secrets)
-        state["wizard"] = wizard
-        wizard.completed.connect(start_dashboard)
-        wizard.cancelled.connect(begin_shutdown)
-        wizard.show()
-
-    # ---- 决定走向导还是直接启动 ----
-    if force_wizard or not paths.CONFIG_FILE.exists():
-        _enter_wizard()
-    else:
-        # 有 config：再校验它引用的密钥是否齐全
-        from app_config.loader import load_config
-        from ui.widgets import show_message
-        secrets_check = SecretsManager(paths)
-        secrets_ok = _safe_initialize_secrets(secrets_check)
-        if not secrets_ok:
-            begin_shutdown()
-            # 不 return：仍要进入下方代码 loop.run_forever，begin_shutdown 调度的 quit 才能跑到
-            # 跳过 config / 启动检查；直接落到 Ctrl+C 设置 + loop.run_forever（很快被 quit 终结）
-            cfg_check = None
-        else:
-            try:
-                cfg_check = load_config(paths)
-            except Exception as e:  # noqa: BLE001
-                logger.exception("配置加载失败")
-                if show_message(
-                    None,
-                    "配置文件读不动",
-                    f"加载 {paths.CONFIG_FILE} 失败：{e}\n\n"
-                    f"可以选择重跑向导覆盖现有配置，或退出手工修复。",
-                    confirm_text="重新配置", cancel_text="退出",
-                ):
-                    _enter_wizard()
-                else:
-                    begin_shutdown()
-            else:
-                app.setStyleSheet(cached_qss(palette_for_theme(cfg_check.app.theme)))
-                missing = _find_missing_secrets(cfg_check, secrets_check)
-                if missing:
-                    logger.warning(f"启动前检测：密钥缺失 {missing}")
-                    if show_message(
-                        None,
-                        "密钥不齐",
-                        "检测到以下配置项引用的密钥已丢失：\n\n  · "
-                        + "\n  · ".join(missing)
-                        + "\n\nDebata 不会以空密钥强行启动（这只会让 API 全报 401）。"
-                        "\n\n请重新配置以覆盖现有 yaml 中的密钥字段。",
-                        confirm_text="重新配置", cancel_text="退出",
-                    ):
-                        _enter_wizard()
-                    else:
-                        begin_shutdown()
-                else:
-                    start_dashboard()
-
-    # ---- Ctrl+C ----
-    stop_flag = {"value": False}
-
-    def _sigint_handler(*_args) -> None:
-        stop_flag["value"] = True
-    _signal.signal(_signal.SIGINT, _sigint_handler)
-
-    def _check_sigint() -> None:
-        if stop_flag["value"]:
-            stop_flag["value"] = False
-            begin_shutdown()
-
-    sigint_timer = QTimer()
-    sigint_timer.setInterval(200)
-    sigint_timer.timeout.connect(_check_sigint)
-    sigint_timer.start()
-
-    try:
-        with loop:
-            loop.run_forever()
-    finally:
-        try:
-            instance_lock.unlock()
-        except Exception:
-            logger.debug("释放 GUI 单实例锁失败", exc_info=True)
-
-
 # ============================================================
 # main
 # ============================================================
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     """同步入口。"""
-    args = parse_args()
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if raw_argv and raw_argv[0] in _SERVICE_COMMANDS:
+        # 通过 .venv/bin/debata 启动时，sys.path[0] 是 .venv/bin；显式加入项目根，
+        # 保证 service_cli 在源码运行和可编辑安装下都能导入。
+        project_root_text = str(Path(__file__).resolve().parent)
+        if project_root_text not in sys.path:
+            sys.path.insert(0, project_root_text)
+        from service_cli import main as service_main
+
+        raise SystemExit(service_main(raw_argv))
+    args = parse_args(raw_argv)
     project_root = Path(__file__).resolve().parent
 
     from app_config import AppPaths, initialize_runtime_data
@@ -665,6 +215,11 @@ def main() -> None:
     setup_logging("INFO", project_root=project_root, logs_dir=paths.LOGS_DIR)
     install_uvloop()
 
+    # 清掉会让 httpx 客户端一构造就抛 InvalidURL 的 NO_PROXY 条目（如 [::1]）。
+    # --no-gui 走 headless Runtime，不经过 webui.server.run_webui，所以这里也要做。
+    sanitize_no_proxy_env()
+
+    # ---- 专项维护命令：做完就退，不启服务 ----
     if args.napcat:
         _run_napcat_setup(paths)
         return
@@ -677,114 +232,61 @@ def main() -> None:
         _run_list_secrets(paths)
         return
 
+    if args.setup:
+        _run_cli_wizard(paths)
+        return
+
+    # ---- 纯命令行模式 ----
     if args.no_gui:
-        # CLI 模式
-        if args.setup or not paths.CONFIG_FILE.exists():
+        if not paths.CONFIG_FILE.exists():
             _run_cli_wizard(paths)
             return
         try:
             asyncio.run(run_headless(project_root, config_file=config_file))
         except KeyboardInterrupt:
             print("\n收到 Ctrl+C，已退出。")
-    else:
-        # GUI 模式：统一入口，内部判断是否要先弹向导
-        run_with_gui(project_root, force_wizard=args.setup, config_file=config_file)
+        return
+
+    # ---- 默认：WebUI ----
+    _run_webui(
+        project_root,
+        host=args.host,
+        port=args.port,
+        token=args.token or None,
+        no_auth=args.no_auth,
+        config_file=config_file,
+    )
+
+
+def _run_webui(
+    project_root: Path,
+    *,
+    host: str,
+    port: int,
+    token: str | None,
+    no_auth: bool,
+    config_file: Path | None,
+) -> None:
+    """启动 WebUI。没有 config.yaml 也不拦，浏览器里会给首次配置向导。"""
+    from webui.server import run_webui
+
+    run_webui(
+        project_root,
+        host=host,
+        port=port,
+        config_file=config_file,
+        token=token,
+        no_auth=no_auth,
+    )
+
+
+# ============================================================
+# main_cli 桥接（保留原有 CLI 能力，去掉 Qt 相关部分）
+# ============================================================
 
 
 def _sync_cli_io() -> None:
     _main_cli.getpass = getpass
-
-
-def _cli_text(prompt: str, default: str | None = None) -> str:
-    return _main_cli._cli_text(prompt, default)
-
-
-def _cli_int(prompt: str, default: int) -> int:
-    return _main_cli._cli_int(prompt, default)
-
-
-def _cli_yes_no(prompt: str, default: bool = False) -> bool:
-    return _main_cli._cli_yes_no(prompt, default)
-
-
-def _cli_secret(prompt: str, *, has_existing: bool = False) -> str:
-    _sync_cli_io()
-    return _main_cli._cli_secret(prompt, has_existing=has_existing)
-
-
-def _cli_choose(
-    prompt: str,
-    choices: list[tuple[str, str]],
-    *,
-    default: str,
-) -> str:
-    return _main_cli._cli_choose(prompt, choices, default=default)
-
-
-def _cli_load_presets(paths) -> dict[str, Any]:
-    return _main_cli._cli_load_presets(paths)
-
-
-def _cli_default_model(
-    presets: dict[str, Any],
-    preset_id: str,
-    fallback: str = "",
-) -> str:
-    return _main_cli._cli_default_model(presets, preset_id, fallback)
-
-
-def _cli_provider_config(
-    *,
-    paths,
-    secrets,
-    cfg,
-    provider_id: str,
-    current_provider,
-    current_model: str,
-    title: str,
-    default_preset: str = "deepseek",
-) -> tuple[str, str]:
-    _sync_cli_io()
-    return _main_cli._cli_provider_config(
-        paths=paths,
-        secrets=secrets,
-        cfg=cfg,
-        provider_id=provider_id,
-        current_provider=current_provider,
-        current_model=current_model,
-        title=title,
-        default_preset=default_preset,
-    )
-
-
-def _cli_agent_config(
-    provider_id: str,
-    model: str,
-    *,
-    temperature: float,
-    max_tokens: int,
-):
-    return _main_cli._cli_agent_config(
-        provider_id,
-        model,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
-
-
-def _cli_configure_napcat(secrets, current):
-    _sync_cli_io()
-    return _main_cli._cli_configure_napcat(secrets, current)
-
-
-def _cli_configure_features(paths, secrets, cfg, main_provider_id: str) -> None:
-    _sync_cli_io()
-    _main_cli._cli_configure_features(paths, secrets, cfg, main_provider_id)
-
-
-def _run_cli_wizard_legacy(paths) -> None:
-    _sync_cli_io()
-    _main_cli._run_cli_wizard_legacy(paths)
 
 
 def _run_cli_wizard(paths) -> None:
@@ -840,14 +342,12 @@ async def _test_adapter(project_root: Path, config_file: Path | None = None) -> 
         await asyncio.sleep(1)
         connected = rt.adapter.is_connected
         marker = "✓" if connected else "·"
-        print(f"  [{i+1}/5] {marker} is_connected={connected}")
+        print(f"  [{i + 1}/5] {marker} is_connected={connected}")
         if connected:
             print("\n✓ 连接成功！")
             break
     else:
         print("\n✗ 5 秒内未建立连接。检查：")
-        adapter_name, cfg = next(iter(rt.config.adapters.items()))
-        endpoint = f"ws://{cfg.host}:{cfg.port}{cfg.path}"
         if cfg.mode == "client":
             print(f"   - NapCat 那边「正向 WS」是否在 {endpoint} 监听？")
             print("   - Token 是否一致？")

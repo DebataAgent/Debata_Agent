@@ -43,6 +43,28 @@ class PipelineInboundMixin:
             return
         self.mark_activity()
 
+        # 黑名单拦截：优先级高于白名单与管理员审核，命中直接丢弃（不回复、不入库）。
+        if self._blacklist_group_ids and event.is_group():
+            try:
+                gid = int(event.group_id or 0)
+            except (TypeError, ValueError):
+                gid = 0
+            if gid in self._blacklist_group_ids:
+                logger.debug(
+                    f"群消息被黑名单拦截：group_id={event.group_id} 已在 {self._blacklist_group_ids}"
+                )
+                return
+        if self._blacklist_qq_ids:
+            try:
+                uid = int(event.user_id or 0)
+            except (TypeError, ValueError):
+                uid = 0
+            if uid in self._blacklist_qq_ids:
+                logger.debug(
+                    f"消息被黑名单拦截：user_id={event.user_id} 已在 {self._blacklist_qq_ids}"
+                )
+                return
+
         # 白名单拦截（仅 mode=whitelist 时严格按名单过滤；open/verify 都放行）
         if self.whitelist.mode == "whitelist":
             if event.is_group():

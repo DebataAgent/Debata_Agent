@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import os
 import time
 from dataclasses import dataclass
 from typing import Literal
@@ -34,28 +33,19 @@ def _timeout(seconds: float) -> httpx.Timeout:
     return httpx.Timeout(seconds, connect=min(5.0, seconds), read=seconds)
 
 
-def _proxy_from_env() -> str | None:
-    """沿用项目运行环境里的代理配置。
-
-    真实 provider SDK 与模型获取功能通常能走系统/环境代理；健康探针如果不走
-    同一路径，就会出现首页误报“请求超时”，但真实模型请求可用。
-    """
-    for key in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
-        value = os.getenv(key)
-        if value:
-            return value
-    return None
-
-
 def _client_kwargs(timeout_seconds: float) -> dict:
-    kwargs = {
-        "timeout": _timeout(timeout_seconds),
-        "trust_env": True,
-    }
-    proxy = _proxy_from_env()
-    if proxy:
-        kwargs["proxy"] = proxy
-    return kwargs
+    """给 httpx 的客户端参数。
+
+    只开 ``trust_env``，**不**显式传 ``proxy=``：显式传参会盖掉 httpx 自己的
+    NO_PROXY 判定，用户写了 ``NO_PROXY=api.example.com`` 也会被硬塞进代理。
+    实测踩过：本机 HTTP(S)_PROXY 指向一个坏代理（TLS 握手 5 秒超时），
+    把中转站加进 NO_PROXY 后健康探针仍然超时——因为这里又把代理塞回去了，
+    首页于是误报「不可用」，而真实模型请求（走 SDK 的 trust_env）是好的。
+    """
+    from utils.proxy_env import sanitize_no_proxy_env
+
+    sanitize_no_proxy_env()
+    return {"timeout": _timeout(timeout_seconds), "trust_env": True}
 
 
 def _short_error(resp: httpx.Response) -> str:

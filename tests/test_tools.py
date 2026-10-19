@@ -231,11 +231,7 @@ async def test_executor_no_action_works():
     ctx = ToolContext()
     executor = reg.get_executor(ctx)
     result = await executor("no_action", {})
-    assert result["ok"] is True
-    assert result["status"] == "done"
-    _assert_tool_result_envelope(result, "no_action")
-    assert result["brief"] == "本轮不执行操作。"
-    assert result.get("no_action") is True
+    assert result == {"ok": True, "no_action": True}
 
 
 @pytest.mark.asyncio

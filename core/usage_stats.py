@@ -15,6 +15,9 @@ from utils.usage_summary import (
     UsageSummary,
 )
 from utils.usage_summary import (
+    add_record_to_summary as _add_record_to_summary,
+)
+from utils.usage_summary import (
     cutoff_timestamp as _cutoff_timestamp,
 )
 
@@ -97,13 +100,7 @@ class UsageStatsStore:
             ts = float(record.get("ts") or 0)
             if cutoff is not None and ts < cutoff:
                 continue
-            summary.request_count += 1
-            summary.prompt_tokens += int(record.get("prompt_tokens") or 0)
-            summary.completion_tokens += int(record.get("completion_tokens") or 0)
-            summary.reasoning_tokens += int(record.get("reasoning_tokens") or 0)
-            summary.cached_tokens += int(record.get("cached_tokens") or 0)
-            summary.cache_creation_tokens += int(record.get("cache_creation_tokens") or 0)
-            summary.total_tokens += int(record.get("total_tokens") or 0)
+            _add_record_to_summary(summary, record)
         return summary
 
     @property

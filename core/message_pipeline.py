@@ -50,7 +50,7 @@ from adapters.base import IAdapter
 from adapters.types import Target as Target
 from agents import ChatAgent, Persona, SummaryAgent, build_messages
 from agents.base import RuntimeEventCallback
-from app_config.schema import BehaviorConfig, FeaturesConfig, WhitelistConfig
+from app_config.schema import BehaviorConfig, BlacklistConfig, FeaturesConfig, WhitelistConfig
 from memory import (
     ArchiveStore,
     HistoryManager,
@@ -192,6 +192,7 @@ class MessagePipeline(
         behavior_cfg: BehaviorConfig,
         features_cfg: FeaturesConfig,
         whitelist: WhitelistConfig | None = None,
+        blacklist: BlacklistConfig | None = None,
         emoji_dir: Path | None = None,
         workspace_dir: Path | None = None,
         rate_limiter: RateLimiter | None = None,
@@ -207,6 +208,7 @@ class MessagePipeline(
         persona_agent: Any = None,
         subconscious_agent: Any = None,
         persona_db: Any = None,
+        token_calibration: Any = None,
         eat_tool: bool = False,
         sleep_tool: bool = False,
     ) -> None:
@@ -226,6 +228,11 @@ class MessagePipeline(
         self.whitelist = whitelist or WhitelistConfig()
         self._whitelist_qq_ids = set(self.whitelist.qq_ids)
         self._whitelist_group_ids = set(self.whitelist.group_ids)
+        # blacklist=None 时视为空名单（不拦截任何人）
+        self.blacklist = blacklist or BlacklistConfig()
+        self._blacklist_qq_ids: set[int] = set()
+        self._blacklist_group_ids: set[int] = set()
+        self._sync_blacklist()
         self.emoji_dir = emoji_dir
         self.workspace_dir = workspace_dir
         self.rate_limiter = rate_limiter
@@ -252,7 +259,26 @@ class MessagePipeline(
         # 退出 _batch_loop 后的兜底 task；保留引用避免 GC
         self._requeue_task: asyncio.Task | None = None
         self._summary_task: asyncio.Task | None = None
-        self._token_calib_ratio = 1.0
+        self.token_calibration = token_calibration
+        self._token_calib_provider = str(
+            getattr(getattr(chat_agent, "provider", None), "name", "") or ""
+        )
+        self._token_calib_model = str(
+            getattr(getattr(chat_agent, "cfg", None), "model", "") or ""
+        )
+        if token_calibration is not None:
+            initial_calibration = token_calibration.get(
+                self._token_calib_provider,
+                self._token_calib_model,
+            )
+            self._token_calib_ratio = initial_calibration.ratio
+            self._token_calib_samples = initial_calibration.samples
+            self._token_calib_mape = initial_calibration.mape
+        else:
+            self._token_calib_ratio = 1.0
+            self._token_calib_samples = 0
+            self._token_calib_mape = 0.0
+        self._fixed_prompt_overhead_cache: int | None = None
         self.last_activity_at = time.monotonic()
         self._inbound_seq = 0
         self._send_manager = _AsyncSendManager(self)
@@ -266,6 +292,20 @@ class MessagePipeline(
         self._group_members_cache: dict[str, tuple[float, set[int]]] = {}
         self._group_members_ttl_seconds: float = 300.0
         self._warn_context_compaction_invariants()
+
+    def _sync_blacklist(self) -> None:
+        """把黑名单配置摊平成两个 set，供入站热路径 O(1) 查询。"""
+        if self.blacklist.enabled:
+            self._blacklist_qq_ids = {int(x) for x in self.blacklist.qq_ids}
+            self._blacklist_group_ids = {int(x) for x in self.blacklist.group_ids}
+        else:
+            self._blacklist_qq_ids = set()
+            self._blacklist_group_ids = set()
+
+    def apply_blacklist(self, blacklist: BlacklistConfig) -> None:
+        """热更新黑名单（WebUI 保存后立即生效，不需要重启）。"""
+        self.blacklist = blacklist
+        self._sync_blacklist()
 
     def mark_activity(self) -> None:
         """刷新活动时间。主动思考只在足够空闲后触发。"""
@@ -493,6 +533,14 @@ class MessagePipeline(
                         conversation_id
                     ),
                     runtime_event_callback=self._runtime_event_callback(conversation_id),
+                    estimated_prompt_tokens=estimated_prompt_tokens,
+                    calib_ratio=self._token_calib_ratio,
+                    auto_finish_after_send=bool(
+                        getattr(self.behavior_cfg, "auto_finish_after_send", True)
+                    ),
+                    kv_diagnostics_mode=str(
+                        getattr(self.behavior_cfg, "kv_prompt_diagnostics", "summary")
+                    ),
                 )
             finally:
                 self._send_manager.end_model_turn(conversation_id)
@@ -518,7 +566,10 @@ class MessagePipeline(
 
             # Phase 0 后发送类工具已在工具调用内即时发送；这里仅保留兼容兜底。
             await self._execute_collected(ctx.collected)
-            self._calibrate_tokens(estimated_prompt_tokens, result.prompt_tokens)
+            # 必须用 first_prompt_tokens：estimated_prompt_tokens 是预检时对**单次**
+            # 请求的估算，而 result.prompt_tokens 是工具循环的累加值（可能是它的
+            # 2~3 倍），两者口径不同，拿累加值校准会把系数推向 >1 的错误方向。
+            self._calibrate_tokens(estimated_prompt_tokens, result.first_prompt_tokens)
             self.mark_activity()
             self._schedule_persona_after_turn(
                 conversation_id=conversation_id,

@@ -17,6 +17,7 @@ from typing import Any
 from utils import get_time
 from utils.token_budget import TokenEstimator
 
+from .model_view import build_model_view, runtime_kind
 from .pipeline_history import _record_timestamp
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,9 @@ class SummaryAttemptResult:
     active_start_after: int = 0
     active_records: int = 0
     active_tokens: int = 0
+    raw_active_tokens: int = 0
+    view_active_tokens: int = 0
+    summarized_records: int = 0
     archived_count: int = 0
     target_after_tokens: int | None = None
     partial_archive_committed: bool = False
@@ -103,17 +107,22 @@ class PipelineSummaryMixin:
                 active_start_after=active_start,
             )
         estimator = self._token_estimator()
-        active_tokens = estimator.estimate_messages(active_records)
+        view = build_model_view(active_records, policy=self._model_view_policy())
+        view_tokens = estimator.estimate_messages(view.records)
+        raw_tokens = estimator.estimate_messages(active_records)
         budget = self._context_budget()
         summarize_cfg = self.behavior_cfg.summarize
         trigger = summarize_cfg.trigger_at_tokens
         if trigger is None:
+            # 百分比阈值按“整份 prompt”定义；固定 system/tools 开销不参与压缩，
+            # 因此活跃视图的触发线要扣掉固定开销。
             trigger = int(
                 budget.max_context_tokens
                 * summarize_cfg.trigger_at_context_percent
                 / 100
-            )
-        token_triggered = active_tokens >= trigger
+            ) - self._fixed_prompt_overhead_tokens()
+            trigger = max(1, trigger)
+        token_triggered = view_tokens >= trigger
         if not force and not token_triggered:
             return SummaryAttemptResult(
                 status="not_needed",
@@ -121,10 +130,12 @@ class PipelineSummaryMixin:
                 active_start_before=active_start,
                 active_start_after=active_start,
                 active_records=len(active_records),
-                active_tokens=active_tokens,
+                active_tokens=view_tokens,
+                raw_active_tokens=raw_tokens,
+                view_active_tokens=view_tokens,
             )
         target_after = self._summary_target_after_tokens(
-            active_tokens=active_tokens,
+            active_tokens=view_tokens,
             override=target_after_tokens,
         )
         if target_after is None:
@@ -134,17 +145,21 @@ class PipelineSummaryMixin:
                 active_start_before=active_start,
                 active_start_after=active_start,
                 active_records=len(active_records),
-                active_tokens=active_tokens,
+                active_tokens=view_tokens,
+                raw_active_tokens=raw_tokens,
+                view_active_tokens=view_tokens,
             )
-        target_after = max(1, min(target_after, active_tokens - 1))
+        target_after = max(1, min(target_after, view_tokens - 1))
 
         logger.info(
-            "活跃历史触发滚动摘要 compaction reason=%s tokens=%s trigger=%s "
-            "records=%s",
+            "活跃历史触发滚动摘要 compaction reason=%s view_tokens=%s raw_tokens=%s "
+            "trigger=%s records=%s view_records=%s",
             reason,
-            active_tokens,
+            view_tokens,
+            raw_tokens,
             trigger,
             len(active_records),
+            len(view.records),
         )
 
         return await self._compact_active_history_unlocked(
@@ -152,7 +167,7 @@ class PipelineSummaryMixin:
             reason=reason,
             active_records=active_records,
             active_start_index=active_start,
-            active_tokens=active_tokens,
+            active_tokens=view_tokens,
             estimator=estimator,
         )
 
@@ -204,17 +219,30 @@ class PipelineSummaryMixin:
                 active_start_after=active_start,
             )
         estimator = estimator or self._token_estimator()
-        active_tokens = active_tokens or estimator.estimate_messages(active)
-        target_after = max(1, min(target_after_tokens, active_tokens - 1))
+        view = build_model_view(active, policy=self._model_view_policy())
+        if not view.records:
+            return SummaryAttemptResult(
+                status="failed",
+                reason="empty_slice",
+                active_start_before=active_start,
+                active_start_after=active_start,
+                active_records=len(active),
+                target_after_tokens=target_after_tokens,
+            )
+        view_tokens = estimator.estimate_messages(view.records)
+        raw_tokens = estimator.estimate_messages(active)
+        target_after = max(1, min(target_after_tokens, view_tokens - 1))
 
         important_text = self.important.text()
-        slice_records = self._select_compaction_slice(
-            active,
-            active_tokens=active_tokens,
+        # 摘要只读“模型可见”的切片，避免把旧 task_context/send_receipt 噪声
+        # 再喂给总结 Agent。归档仍然写原始切片。
+        summary_slice = self._select_compaction_slice(
+            view.records,
+            active_tokens=view_tokens,
             target_after_tokens=target_after,
             estimator=estimator,
         )
-        if not slice_records:
+        if not summary_slice:
             logger.warning("compaction 未选出可归档切片，跳过")
             return SummaryAttemptResult(
                 status="failed",
@@ -222,16 +250,46 @@ class PipelineSummaryMixin:
                 active_start_before=active_start,
                 active_start_after=active_start,
                 active_records=len(active),
-                active_tokens=active_tokens,
+                active_tokens=view_tokens,
+                raw_active_tokens=raw_tokens,
+                view_active_tokens=view_tokens,
                 target_after_tokens=target_after,
             )
 
-        try:
-            result = await self.summary_agent.summarize_rolling(
-                slice_records,
-                self.rolling_summary.text(),
-                important_text,
+        raw_cut = view.raw_indices[len(summary_slice) - 1] + 1
+        raw_cut = self._provider_safe_prefix_len(active, raw_cut)
+        slice_records = active[:raw_cut]
+        if not slice_records:
+            logger.warning("compaction 原始切片为空，跳过")
+            return SummaryAttemptResult(
+                status="failed",
+                reason="empty_slice",
+                active_start_before=active_start,
+                active_start_after=active_start,
+                active_records=len(active),
+                active_tokens=view_tokens,
+                raw_active_tokens=raw_tokens,
+                view_active_tokens=view_tokens,
+                target_after_tokens=target_after,
             )
+
+        # 总结 Agent 只读真实聊天；旧运行时快照只影响游标推进，不参与摘要。
+        summary_input = [
+            record for record in summary_slice if runtime_kind(record) is None
+        ]
+        try:
+            if summary_input:
+                result = await self.summary_agent.summarize_rolling(
+                    summary_input,
+                    self.rolling_summary.text(),
+                    important_text,
+                )
+            else:
+                result = {
+                    "summary_text": self.rolling_summary.text()
+                    or "（仅清理运行时快照，无新增摘要）",
+                    "new_important": [],
+                }
         except Exception as e:
             logger.warning("滚动摘要 Agent 调用失败: %s", e)
             return SummaryAttemptResult(
@@ -240,7 +298,9 @@ class PipelineSummaryMixin:
                 active_start_before=active_start,
                 active_start_after=active_start,
                 active_records=len(active),
-                active_tokens=active_tokens,
+                active_tokens=view_tokens,
+                raw_active_tokens=raw_tokens,
+                view_active_tokens=view_tokens,
                 target_after_tokens=target_after,
             )
         if not result:
@@ -251,7 +311,9 @@ class PipelineSummaryMixin:
                 active_start_before=active_start,
                 active_start_after=active_start,
                 active_records=len(active),
-                active_tokens=active_tokens,
+                active_tokens=view_tokens,
+                raw_active_tokens=raw_tokens,
+                view_active_tokens=view_tokens,
                 target_after_tokens=target_after,
             )
 
@@ -270,11 +332,13 @@ class PipelineSummaryMixin:
                 active_start_before=active_start,
                 active_start_after=active_start,
                 active_records=len(active),
-                active_tokens=active_tokens,
+                active_tokens=view_tokens,
+                raw_active_tokens=raw_tokens,
+                view_active_tokens=view_tokens,
                 target_after_tokens=target_after,
             )
 
-        new_active_start = active_start + len(slice_records)
+        new_active_start = active_start + raw_cut
         archive_key = self._compaction_archive_key(active_start, slice_records)
         partial_archives = self._partial_compaction_archives()
         archive_reused = archive_key in partial_archives
@@ -315,7 +379,9 @@ class PipelineSummaryMixin:
                 active_start_before=active_start,
                 active_start_after=active_start,
                 active_records=len(active),
-                active_tokens=active_tokens,
+                active_tokens=view_tokens,
+                raw_active_tokens=raw_tokens,
+                view_active_tokens=view_tokens,
                 target_after_tokens=target_after,
                 partial_archive_committed=archive_key in partial_archives,
                 archive_reused=archive_reused,
@@ -345,13 +411,26 @@ class PipelineSummaryMixin:
             f"[滚动摘要] 已归档并移动活跃窗口起点 {len(slice_records)} 条；"
             f"新增重要记忆 {saved_important_count} 条"
         )
+        logger.info(
+            "滚动摘要完成：raw_active=%s view_active=%s summarized=%s "
+            "summary_input=%s archived=%s target_after=%s",
+            raw_tokens,
+            view_tokens,
+            len(summary_slice),
+            len(summary_input),
+            len(slice_records),
+            target_after,
+        )
         return SummaryAttemptResult(
             status="success",
             reason=reason,
             active_start_before=active_start,
             active_start_after=new_active_start,
             active_records=len(active),
-            active_tokens=active_tokens,
+            active_tokens=view_tokens,
+            raw_active_tokens=raw_tokens,
+            view_active_tokens=view_tokens,
+            summarized_records=len(summary_input),
             archived_count=len(slice_records),
             target_after_tokens=target_after,
             archive_reused=archive_reused,
@@ -392,11 +471,12 @@ class PipelineSummaryMixin:
         if target_after is None:
             target_after = summarize_cfg.target_after_tokens
         if target_after is None:
+            # 百分比目标按整份 prompt 定义；减去固定开销后才是活跃视图目标。
             target_after = int(
                 self._context_budget().max_context_tokens
                 * summarize_cfg.target_after_context_percent
                 / 100
-            )
+            ) - self._fixed_prompt_overhead_tokens()
         return max(1, min(int(target_after), active_tokens - 1))
 
     def _active_start_index_for_records(self, records: list[dict[str, Any]]) -> int:

@@ -2,6 +2,45 @@
 
 本文件记录 Debata 所有重要变更，格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased] — token 效率重构
+
+### Added
+- 新增非破坏性“模型视图”（`core/model_view.py`）：只裁剪发给模型的历史视图，历史/归档/事件库原样保留。默认只保留最近 2 个 `task_context`、2 条发送回执、2 条发送完成快照和 4 组 `no_action`。
+- 新增按 provider/model 持久化的 token 校准（`core/token_calibration.py` + 实例目录 `token_calibration.json`），重启后不再退回 1.0。
+- 新增 `scripts/benchmark_prompt_tokens.py`：只读对比重构前后的活跃历史、系统提示、工具 schema 与估算 prompt。
+- 新增工具 schema `compact` 档位：核心字段直出，高级字段通过 `tool_search detail=full` 查看；默认 11 个 compact + 其余 stub。
+- 新增发送成功后自动收尾（`behavior.auto_finish_after_send`），省掉一次 `no_action` 收尾模型调用。
+- 用量面板新增“未命中输入 token / 估算误差 / 估算样本”。
+- 新增 [后台运行指南](docs/background_running.md)：systemd 用户/系统级服务、tmux、screen、nohup、升级与排错。
+- 新增 `scripts/install_systemd_user.sh` 一键安装脚本和 `scripts/systemd/` 单元模板。
+- 新增简化服务命令：`debata start` / `stop` / `restart` / `status` / `log` / `enable` / `disable`，底层自动调用 systemd；首次 `debata start` 会自动安装服务。
+
+### Changed
+- README 中英文重写：补充 Token 效率、后台运行、数据目录、测试与安全说明；clone 地址更新为本项目仓库。
+- 更新 getting_started / features / architecture / kv_cache_benchmark，加入模型视图、compact 工具、自动收尾与 2026-10 基准数据。
+- 滚动摘要触发/目标默认从 75%/50%/30% 调整为 50%/30%/20%，并按“模型可见视图 + 固定开销”口径计算；128k 工作预算需要在设置页或实例配置中显式设置。
+- KV 诊断默认改为 `summary` 轻量模式，不再每轮对完整消息与工具集做多次全量 JSON 序列化。
+- 工具 schema 移除通用 `finish_after_success` 参数；执行层仍兼容旧调用。
+- 发送类工具结果不再回显已发送正文，只保留 msg_id/order/状态等定位信息。
+- token 估算改用规范 JSON（messages + tools）口径，并为小文本与工具 schema 增加缓存。
+
+### Fixed
+- 修正 `str(tools_schema)` 造成的工具 schema token 估算偏差。
+- 修正 `cached_tokens > prompt_tokens` 等脏数据导致缓存命中率超过 100% 的问题。
+- 避免旧运行时快照触发压缩、以及总结 Agent 重复读取旧快照的问题。
+- 修正 `debata start/stop/restart` 中 systemctl 参数顺序错误（服务名必须在命令之后）。
+- 修正端口被占用时启动崩溃的问题：现在会提示“可能已在运行”，并给出 `debata status/log` 与换端口命令。
+- 修正 WebUI “对话”页加载超时：归档/事件改为一次性快速读取，会话分组去掉 O(n²) 扫描，合并结果增加缓存，大群对话先截取尾部窗口再归一化，前端请求超时提升到 60 秒。
+- 修正真实数据下“对话”页大群（8,889 条记录）无法正常显示的问题。
+- 修正没有 systemd 用户会话（容器 / WSL / 精简系统）时 `debata` 命令全部失败的问题：现在自动回退到 PID 文件 + 独立后台进程，`start/stop/restart/status/log` 仍可用；`enable` 会启动后台进程并说明开机自启的限制。
+- 修正安装脚本在 `systemctl --user` 无法连接 bus 时直接报错退出的问题：现在检测用户 bus，跳过 unit 安装并启动内置后台模式。
+
+### Measured
+- 真实实例活跃历史：185,173 → 43,248 估算 token（-76.6%）。
+- 工具 schema：full 档位 9,817 → compact 档位 4,740 token。
+- 估算单次主 prompt：206,768 → 59,766（-71.1%）。
+- WebUI 对话页：归档加载 15.5s → 1.9s；分组 183s → 1.1s；大群展示首次 5.27s → 0.74s（隔离基准）。
+
 ## [v0.9.0-alpha] — 2026-07-04
 
 ### Added

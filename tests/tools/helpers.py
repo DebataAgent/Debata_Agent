@@ -28,11 +28,13 @@ def _make_config(
     persona_management_enabled=False,
     energy_mode="disabled",
     satiety_mode="disabled",
+    tool_schema_profile="full",
 ):
     """构造最小合法 RootConfig。"""
     from app_config.schema import (
         AgentConfig,
         AgentsConfig,
+        BehaviorConfig,
         FeaturesConfig,
         LongTermMemoryConfig,
         PersonaManagementConfig,
@@ -72,6 +74,7 @@ def _make_config(
                 "satiety": {"mode": satiety_mode},
             },
         ),
+        behavior=BehaviorConfig(tool_schema_profile=tool_schema_profile),
     )
 
 

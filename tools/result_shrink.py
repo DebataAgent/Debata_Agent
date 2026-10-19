@@ -16,6 +16,139 @@ from utils.token_budget import TokenEstimator
 
 _LINE_TOOLS = {"get_forward_msg"}
 
+SEND_RESULT_TOOLS = {
+    "send_private_messages",
+    "send_group_message",
+    "send_voice_message",
+    "commit_send_attempt",
+}
+
+_SEND_RESULT_KEEP_KEYS = (
+    "ok",
+    "status",
+    "brief",
+    "send_id",
+    "send_attempt_id",
+    "attempt_revision",
+    "revision",
+    "latest_seq",
+    "reviewed_until_seq",
+    "review_policy",
+    "delivery_interrupt_policy",
+    "ignore_review_interrupts",
+    "ignored_review_interrupts",
+    "accepted",
+    "delivery",
+    "qq_visible",
+    "count",
+    "errors",
+    "turn_completion",
+    "next",
+    "data",
+    "unseen_messages",
+    "forced_unseen_messages",
+    "priority_interrupts",
+    "recalled_messages",
+    "new_messages",
+)
+
+_SEND_AUX_KEYS = (
+    "data",
+    "unseen_messages",
+    "forced_unseen_messages",
+    "priority_interrupts",
+    "recalled_messages",
+    "new_messages",
+)
+
+
+def _shrink_aux_value(value: Any, limit: int = 160) -> Any:
+    """保留 review 语义所需的嵌套结构，只截断过长的字符串正文。"""
+    if isinstance(value, str):
+        return value[:limit]
+    if isinstance(value, list):
+        return [_shrink_aux_value(item, limit) for item in value]
+    if isinstance(value, dict):
+        return {
+            str(key): _shrink_aux_value(item, limit)
+            for key, item in value.items()
+        }
+    return value
+
+_SEND_ITEM_KEEP_KEYS = (
+    "order",
+    "conversation_id",
+    "target_type",
+    "target_id",
+    "target_qq",
+    "group_id",
+    "delay",
+    "msg_id",
+    "send_id",
+    "revision",
+    "attempt_revision",
+    "qq_visible",
+    "status",
+    "error",
+)
+
+
+def project_send_result_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """把发送类工具结果压缩成模型真正需要的字段。
+
+    模型已经知道自己发了什么（assistant tool_calls 里就是原文），结果里再回显
+    整段 content 只会重复消耗 token。这里保留定位/状态/msg_id，未发送内容只留
+    160 字符，便于模型判断是否需要改写或补发。
+    """
+    if not isinstance(payload, dict):
+        return payload
+    projected: dict[str, Any] = {
+        key: payload[key] for key in _SEND_RESULT_KEEP_KEYS if key in payload
+    }
+    for key in _SEND_AUX_KEYS:
+        if key in projected:
+            projected[key] = _shrink_aux_value(projected[key])
+    for key in ("sent", "unsent", "accepted_messages", "attempted_messages"):
+        value = payload.get(key)
+        if not isinstance(value, list):
+            continue
+        items: list[dict[str, Any]] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            compact = {
+                field: item[field]
+                for field in _SEND_ITEM_KEEP_KEYS
+                if field in item
+            }
+            content = str(item.get("content") or "")
+            if content:
+                # 保留短预览，方便模型/聊天记录页定位；正文不再整段回显。
+                limit = 160 if key == "unsent" else 80
+                compact["content"] = content[:limit]
+            items.append(compact)
+        projected[key] = items
+    return projected
+
+
+def _is_projected_send_result(payload: dict[str, Any]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("tool") not in SEND_RESULT_TOOLS:
+        return False
+    for key in ("sent", "unsent", "accepted_messages", "attempted_messages"):
+        value = payload.get(key)
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if isinstance(item, dict) and "content" in item and key != "unsent":
+                return False
+            if isinstance(item, dict) and any(
+                field in item for field in ("delay", "time", "target_qq", "group_id")
+            ):
+                return False
+    return True
+
 
 @dataclass(frozen=True, slots=True)
 class ToolBudget:
@@ -34,8 +167,13 @@ def shrink_tool_result(tool_name: str, result: dict[str, Any], ctx: Any) -> dict
     hard_cap = budget.hard_cap
     estimator = TokenEstimator()
 
+    if tool_name == "no_action":
+        return {"ok": True, "no_action": True}
+
     shrunk = copy.deepcopy(result)
-    if tool_name == "web_search":
+    if tool_name in SEND_RESULT_TOOLS:
+        shrunk = project_send_result_payload(shrunk)
+    elif tool_name == "web_search":
         shrunk = _shrink_web_search(shrunk, soft_limit, estimator)
     elif tool_name == "list_contacts":
         shrunk = _shrink_contacts(tool_name, shrunk)

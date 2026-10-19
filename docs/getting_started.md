@@ -18,25 +18,24 @@ NapCat 启动后，记下它的 WebSocket 地址和 token（如果设了的话�
 git clone https://github.com/binglang001/Debata_Agent.git
 cd Debata_Agent
 
-python -m venv venv
-venv\Scripts\activate       # Windows
-source venv/bin/activate    # macOS / Linux
-
-pip install -e ".[gui]"
-python main.py
+python -m pip install uv      # 没装 uv 的话先装
+uv sync
+uv run main.py
 ```
 
-首次启动会自动进入配置向导。以后启动直接进仪表盘。服务器跑 `python main.py --no-gui` 跳过 GUI。
+启动后终端会打印访问地址和令牌，浏览器打开即可。首次启动检测不到配置会自动进入配置向导，
+以后启动直接进仪表盘。纯命令行环境跑 `uv run main.py --no-gui`，不启动 WebUI。
+后台长期运行见 [后台运行指南](background_running.md)。
 
 环境要求：Python 3.11+，一个 LLM API 密钥（推荐 [DeepSeek](https://platform.deepseek.com)）。
 
 Linux 服务器或 SSH 环境可以直接跑纯 CLI 向导：
 
 ```bash
-python main.py --no-gui --setup
+uv run main.py --no-gui --setup
 ```
 
-CLI 向导覆盖主模型、子 Agent、图片理解、天气、TTS、RAG、NapCat 和人格等主要配置。密钥优先保存到系统 keyring；如果 Linux 没有可用 Secret Service，会自动退回 `data/rsa_private.pem` 本地私钥文件，并使用 0600 权限保护。
+CLI 向导覆盖主模型、子 Agent、图片理解、天气、TTS、RAG、NapCat 和人格等主要配置。密钥优先保存到系统 keyring；如果 Linux 没有可用 Secret Service，会自动退回数据目录下的 `rsa_private.pem` 本地私钥文件（默认 `~/.local/share/Debata_Agent/instances/default/rsa_private.pem`），并使用 0600 权限保护。
 
 ---
 
@@ -93,8 +92,12 @@ CLI 向导覆盖主模型、子 Agent、图片理解、天气、TTS、RAG、NapC
 三种方式：
 
 - **仓库自带**：直接用 Debata，开箱即用
-- **AI 辅助创建**：描述你想要的角色，AI 帮你写完整的 [人格档案](persona_writing_guide.md)
+- **AI 辅助创建**：描述你想要的角色，配置完成后到「角色 → 新建角色」，AI 帮你写完整的 [人格档案](persona_writing_guide.md)
 - **导入**：你已经写好了 `persona_prompt.py`，从磁盘导入
+
+> 向导里选「生成一个新人格」时填的那段描述**不会丢**——它先存到数据目录，
+> 配置完成后打开「角色 → 新建角色」会替你填好，直接点「生成」就行。
+> 生成这一步要在配置完成后做，因为生成人格需要真的调用一次模型。
 
 ### 确认 & 启动
 
@@ -128,13 +131,49 @@ CLI 向导覆盖主模型、子 Agent、图片理解、天气、TTS、RAG、NapC
 
 角色页 → 选中目标 → 点「切换为当前」→ 重启 Debata。
 
+### 新建一个角色（AI 生成）
+
+角色页 → 「新建角色」：
+
+1. 填**目录名**（字母开头，它会成为 `personas/<名字>/`）和**显示名**（可以中文）
+2. 下面几栏是给 AI 的提示——性格、过往、说话的样子、不会做的事、绝不会说的话、
+   对不同人的差别、敏感话题。想到什么写什么，空着也能生成
+3. 点「生成」，十几秒后出草稿。预览按 `identity / past / personality / voice /
+   boundaries / relation_with_user / consistency_anchors` 分节显示
+4. 不满意就改改描述再点「再生成一次」——**草稿只在浏览器里，不写盘**
+5. 满意后点「采用并保存」
+
+### 修改一个角色（AI 改写）
+
+角色页 → 目标行点「修改」：
+
+1. 弹出当前人设（作为改写底稿）
+2. 写一句想改的地方，比如「再冷淡一点」「少说反问句」「她的猫呢，提一句」
+3. 点「生成修改版」，可以**反复生成第 N 版**，每版都能预览
+4. 点「采用并覆盖」才写盘。**覆盖前自动备份**到
+   `personas/<名字>/.backups/persona_prompt_<时间戳>.py`
+
+角色名相同会拒绝覆盖，除非你确认；「复制」则以现有角色为模板建一个新的。
+
 ### 加表情包
 
-把自己收藏的图片（png / jpg / gif）放进 `data/emoji/` 目录。文件名就是 AI 引用时的名字，建议起容易懂的（如「笑哭」「困」）。设置页表情包区也可以拖放添加。
+侧栏「表情包」页 → 「添加表情包」：拖图片进去，或点开选择文件。可以在上传前逐个改名——
+**名字就是 AI 引用时用的名字**，建议起容易懂的（如「笑哭」「困」而不是 `emoji_0142`）。
 
-![表情包](https://raw.githubusercontent.com/binglang001/Debata_Agent/main/docs/images/dashboard_settings_emoji.png)
+也可以直接把图片丢进数据目录的 `emoji/`（默认 `~/.local/share/Debata_Agent/instances/default/emoji/`），效果一样。支持 png / jpg / jpeg / gif，单个不超过 5MB。
+重名会自动加 `_1` 后缀。
 
-### 改模型
+### 改模型 / 加中转站
+
+设置 →「模型」：
+
+- **添加提供商**：填名称，协议选「OpenAI 兼容」，Base URL 填中转站地址，粘 API Key。
+  点「获取模型列表」能拉到就直接选，拉不到就手填模型 ID。
+  点「测试连接」会真发一次最小请求，通过再保存。
+- **换模型**：在下面的 Agent 卡片里选提供商、填模型 ID。
+- **思考参数风格**：中转站拿不准就选 `none`，这样不会把厂商私有字段发给不认识它的网关。
+
+改动需要重启 Runtime 才生效，页面会给出「立即重启」提示。
 
 ![设置模型](https://raw.githubusercontent.com/binglang001/Debata_Agent/main/docs/images/dashboard_settings_model.png)
 
@@ -142,7 +181,7 @@ CLI 向导覆盖主模型、子 Agent、图片理解、天气、TTS、RAG、NapC
 
 ### 调上下文预算
 
-设置页 → Token预算 → 滚动摘要压缩，可以调触发滚动摘要的上下文占比、压缩后的活跃窗口目标，以及第一次压缩仍超预算时的重试压缩目标。正常使用建议保留默认值；这里不再提供“保留最近 N 条工作历史”一类旧裁剪开关。
+设置页 → Token预算 → 滚动摘要压缩，可以调触发滚动摘要的上下文占比、压缩后的活跃窗口目标，以及第一次压缩仍超预算时的重试压缩目标。当前默认是 50/30/20，并启用模型视图（只裁剪发给模型的旧运行时快照，不删除落盘历史）。正常使用建议保留默认值；这里不再提供“保留最近 N 条工作历史”一类旧裁剪开关。
 
 ### 调主题
 
@@ -160,7 +199,34 @@ CLI 向导覆盖主模型、子 Agent、图片理解、天气、TTS、RAG、NapC
 - **AI 现场捏一个**: 向导里描述「我想要一个 25 岁的程序员、嘴硬心软、爱猫」, 等几秒看 AI 写出来
 - **手写**: 照 `personas/debata/persona_prompt.py` 葫芦画瓢, 放到 `personas/{你的名字}/`
 
-#### 每个 persona 都有自己独立的 `data/memory/{name}/` 目录存历史与重要记忆, 互不干扰.
+#### 每个 persona 都有自己独立的 `memory/{name}/` 目录存历史与重要记忆（默认数据目录 `~/.local/share/Debata_Agent/instances/default/`），互不干扰.
+
+---
+
+## 7.后台运行
+
+调试完成后，不要让 Debata 依赖 SSH 窗口。一次性安装后，用短命令管理：
+
+```bash
+cd ~/Debata_Agent
+bash scripts/install_systemd_user.sh   # 一次性安装并启动
+
+debata start       # 启动
+debata stop        # 停止
+debata log         # 查看日志
+debata enable      # 开机自启
+debata disable     # 取消开机自启
+debata status      # 状态
+```
+
+`debata enable` 会尝试开启 linger；如果提示失败，执行
+`sudo loginctl enable-linger "$USER"`。只跑 headless 用
+`bash scripts/install_systemd_user.sh --headless`。
+临时挂机可以用 `tmux new -s debata` 或 `screen -S debata`。
+NapCat 需要单独保持运行。
+
+完整说明（系统级服务、nohup、升级、排错、安全建议）见
+[后台运行指南](background_running.md)。
 
 ---
 

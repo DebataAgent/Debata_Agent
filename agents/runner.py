@@ -43,6 +43,7 @@ from .base import (
     ToolExecutor,
     UsageRecorder,
 )
+from .context_builder import first_tail_block_index
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,20 @@ SEND_TOOL_NAMES: set[str] = {
     "send_voice_message",
 }
 
+AUTO_FINISH_TOOL_NAMES: set[str] = {
+    *SEND_TOOL_NAMES,
+    "commit_send_attempt",
+    "save_important_memory",
+    "update_important_memory",
+    "delete_important_memory",
+    "schedule_wakeup",
+    "tool_search",
+}
+"""发送成功后允许直接收尾的工具集合。
+
+模型如果还想看结果/保存记忆/安排 wakeup，需要把这些调用和发送放在同一轮。
+"""
+
 LOOP_REMINDER_MESSAGE = (
     "你已连续多轮调用工具。请重新审视任务内容和执行情况，不要在同一个错误上反复无意义尝试；"
     "必要时更换方向、汇报进展或收尾。"
@@ -90,6 +105,7 @@ class AgentRunner:
             no_feedback_tools if no_feedback_tools is not None else DEFAULT_NO_FEEDBACK_TOOLS
         )
         self.runtime_event_callback = runtime_event_callback
+        self._kv_tools_diag_cache: dict[int, tuple[int, dict[str, Any]]] = {}
 
     async def run(
         self,
@@ -104,6 +120,10 @@ class AgentRunner:
         status_callback: StatusCallback | None = None,
         runtime_event_callback: RuntimeEventCallback | None = None,
         status_label: str = "主模型",
+        estimated_prompt_tokens: int = 0,
+        calib_ratio: float = 1.0,
+        kv_diagnostics_mode: str = "summary",
+        auto_finish_after_send: bool = False,
     ) -> AgentRunResult:
         """执行多轮工具循环。
 
@@ -119,6 +139,10 @@ class AgentRunner:
         loop_count = 0
         no_tool_retry_count = 0
         prompt_tokens_total = 0
+        # 只记第一次调用的 prompt_tokens：它才是与上下文预检估算口径一致的那个
+        # prompt。后续工具循环会把工具结果不断追加进来，累加值远大于预检估算，
+        # 拿累加值做校准会把 ratio 推向 >1，反而让估算越来越离谱。
+        first_prompt_tokens = 0
         refocus_interval = self.cfg.refocus_interval
         reminder_interval = max(1, int(self.cfg.tool_loop_reminder_interval))
         final_warning_count = max(1, int(self.cfg.tool_loop_final_warning_count))
@@ -239,6 +263,7 @@ class AgentRunner:
                     finish_reason="api_error",
                     reasoning_logs=reasoning_logs,
                     prompt_tokens=prompt_tokens_total,
+                    first_prompt_tokens=first_prompt_tokens,
                 )
             except ProviderError as e:
                 logger.error(f"AgentRunner API 错误（轮次 {loop_count}）: {e}")
@@ -256,6 +281,7 @@ class AgentRunner:
                     finish_reason="api_error",
                     reasoning_logs=reasoning_logs,
                     prompt_tokens=prompt_tokens_total,
+                    first_prompt_tokens=first_prompt_tokens,
                 )
             except Exception as e:
                 logger.exception(f"AgentRunner 未知错误（轮次 {loop_count}）: {e}")
@@ -273,8 +299,11 @@ class AgentRunner:
                     finish_reason="api_error",
                     reasoning_logs=reasoning_logs,
                     prompt_tokens=prompt_tokens_total,
+                    first_prompt_tokens=first_prompt_tokens,
                 )
 
+            if first_prompt_tokens <= 0:
+                first_prompt_tokens = int(result.usage.prompt_tokens or 0)
             prompt_tokens_total += result.usage.prompt_tokens
             await self._record_usage(
                 usage_recorder,
@@ -287,6 +316,14 @@ class AgentRunner:
                     tools,
                     loop=loop_count,
                     model=self.cfg.model,
+                    mode=kv_diagnostics_mode,
+                    tools_diag_cache=self._kv_tools_diag_cache,
+                ),
+                **self._token_estimate_metadata(
+                    estimated_prompt_tokens,
+                    result.usage.prompt_tokens,
+                    calib_ratio,
+                    loop=loop_count,
                 ),
             )
             if result.reasoning_content:
@@ -359,7 +396,17 @@ class AgentRunner:
                 not blocked_by_result
                 and self._all_non_no_action_results_allow_completion(tc_results)
             )
-            normal_finish = bool(stop_results or no_action_finished or finish_after_success)
+            auto_finish_after_send_result = (
+                auto_finish_after_send
+                and not blocked_by_result
+                and self._should_auto_finish_after_send(tc_results)
+            )
+            normal_finish = bool(
+                stop_results
+                or no_action_finished
+                or finish_after_success
+                or auto_finish_after_send_result
+            )
 
             append_final_warning_after_tool_records = False
             if not normal_finish:
@@ -419,6 +466,11 @@ class AgentRunner:
                 continue
 
             # === 终止条件检查 ===
+            if auto_finish_after_send_result:
+                final_content = result.content or ""
+                finish_reason = "finish_after_send"
+                break
+
             if no_action_finished:
                 final_content = "NO_ACTIONS"
                 finish_reason = "no_action"
@@ -446,6 +498,7 @@ class AgentRunner:
                 usage_recorder=usage_recorder,
                 status_callback=status_callback,
                 status_label=status_label,
+                kv_diagnostics_mode=kv_diagnostics_mode,
             )
             if final_result is not None:
                 prompt_tokens_total += final_result.usage.prompt_tokens
@@ -472,6 +525,7 @@ class AgentRunner:
             finish_reason=finish_reason,
             reasoning_logs=reasoning_logs,
             prompt_tokens=prompt_tokens_total,
+            first_prompt_tokens=first_prompt_tokens,
         )
 
     # ============================================================
@@ -519,6 +573,35 @@ class AgentRunner:
                 if content:
                     return content
         return ""
+
+    @staticmethod
+    def _token_estimate_metadata(
+        estimated_prompt_tokens: int,
+        actual_prompt_tokens: int,
+        calib_ratio: float,
+        *,
+        loop: int,
+    ) -> dict[str, Any]:
+        """把预检估算与真实用量的对照写进 usage 记录。
+
+        只有第一次调用（loop=1）的估算和实际口径一致；工具循环后续轮次
+        的 prompt 已经增长，不能拿来算误差。
+        """
+        if estimated_prompt_tokens <= 0:
+            return {}
+        metadata: dict[str, Any] = {
+            "estimated_prompt_tokens": int(estimated_prompt_tokens),
+            "calib_ratio": round(float(calib_ratio), 4),
+        }
+        if loop == 1 and actual_prompt_tokens > 0:
+            metadata["prompt_estimate_ratio"] = round(
+                actual_prompt_tokens / estimated_prompt_tokens,
+                4,
+            )
+            metadata["prompt_estimate_error_tokens"] = int(
+                actual_prompt_tokens - estimated_prompt_tokens
+            )
+        return metadata
 
     async def _record_usage(
         self,
@@ -593,6 +676,7 @@ class AgentRunner:
         usage_recorder: UsageRecorder | None,
         status_callback: StatusCallback | None,
         status_label: str,
+        kv_diagnostics_mode: str = "summary",
     ) -> CompletionResult | None:
         """工具循环最终宽限用尽后做一次无工具收尾。
 
@@ -630,6 +714,8 @@ class AgentRunner:
                     None,
                     loop=0,
                     model=self.cfg.model,
+                    mode=kv_diagnostics_mode,
+                    tools_diag_cache=self._kv_tools_diag_cache,
                 ),
             )
             return result
@@ -751,6 +837,40 @@ class AgentRunner:
         completion.setdefault("reason", "finish_after_success")
         marked["turn_completion"] = completion
         return marked
+
+    @staticmethod
+    def _result_is_successful_send(result: dict[str, Any]) -> bool:
+        if result.get("ok") is False or result.get("errors"):
+            return False
+        if result.get("qq_visible") is True or result.get("accepted") is True:
+            return True
+        status = str(result.get("status") or "").strip().lower()
+        return status in {"sent", "accepted", "done", "ok", "success"}
+
+    @staticmethod
+    def _should_auto_finish_after_send(tc_results: list[dict[str, Any]]) -> bool:
+        """发送成功且本轮没有其它待执行动作时，直接收尾。
+
+        条件严格限制在发送/提交/记忆类工具；只要模型还调用了查询或人格动作，
+        就继续循环，避免吞掉发送后的观察需求。
+        """
+        if not tc_results:
+            return False
+        names = {str(item.get("name") or "") for item in tc_results}
+        if not names or not names <= AUTO_FINISH_TOOL_NAMES:
+            return False
+        send_results = [
+            item["result"]
+            for item in tc_results
+            if item.get("name") in SEND_TOOL_NAMES
+            or item.get("name") == "commit_send_attempt"
+        ]
+        if not send_results:
+            return False
+        return any(
+            AgentRunner._result_is_successful_send(result)
+            for result in send_results
+        )
 
     @staticmethod
     def _tool_result_blocks_completion(result: dict[str, Any]) -> bool:
@@ -976,8 +1096,189 @@ def _kv_prompt_diagnostics(
     *,
     loop: int,
     model: str = "",
+    mode: str = "full",
+    tools_diag_cache: dict[int, tuple[int, dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
-    """生成轻量 KV 诊断信息，只记录结构和哈希，不记录正文。"""
+    """生成轻量 KV 诊断信息，只记录结构和统计，不记录正文。
+
+    模式：
+        off      —— 只返回模式标记，零序列化。
+        summary  —— 单遍遍历，不拼整段 JSON；生产默认由配置传入。
+        full     —— 旧行为，保留全量哈希；直接调用时的兼容默认值。
+    """
+    selected = str(mode or "summary").strip().lower()
+    if selected == "off":
+        return {"kv_diagnostics_mode": "off", "kv_loop": int(loop)}
+    if selected == "full":
+        diag = _kv_prompt_diagnostics_full(
+            messages,
+            tools,
+            loop=loop,
+            model=model,
+        )
+        diag["kv_diagnostics_mode"] = "full"
+        return diag
+    diag = _kv_prompt_diagnostics_summary(
+        messages,
+        tools,
+        loop=loop,
+        tools_diag_cache=tools_diag_cache,
+    )
+    diag["kv_diagnostics_mode"] = "summary"
+    return diag
+
+
+def _kv_prompt_diagnostics_summary(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    *,
+    loop: int,
+    tools_diag_cache: dict[int, tuple[int, dict[str, Any]]] | None,
+) -> dict[str, Any]:
+    role_counts: dict[str, int] = {}
+    role_chars: dict[str, int] = {}
+    roles: list[str] = []
+    content_char_count = 0
+    block_counts = {"task_context": 0, "send_receipt": 0, "rag": 0}
+    block_chars = {"task_context": 0, "send_receipt": 0, "rag": 0}
+    recent_group_lines = 0
+    has_recent_group = False
+
+    for message in messages:
+        role = str(message.get("role") or "")
+        if not role:
+            continue
+        roles.append(role)
+        role_counts[role] = role_counts.get(role, 0) + 1
+        content = message.get("content")
+        text = content if isinstance(content, str) else ""
+        role_chars[role] = role_chars.get(role, 0) + len(text)
+        content_char_count += len(text)
+        for marker, key in (
+            ("<task_context", "task_context"),
+            ("<send_receipt", "send_receipt"),
+            ("<retrieved_conversation_context", "rag"),
+        ):
+            count = text.count(marker)
+            if count:
+                block_counts[key] += count
+                # 这些块整条消息就是块本身；按消息长度计，避免正则扫描整段上下文。
+                block_chars[key] += len(text)
+        if "<recent_group_messages" in text:
+            has_recent_group = True
+        if " msg_id=" in text:
+            recent_group_lines += text.count(" msg_id=")
+
+    tail_start = first_tail_block_index(messages)
+    stable_hasher = hashlib.sha256()
+    stable_char_count = 0
+    for message in messages[:tail_start]:
+        role = str(message.get("role") or "")
+        content = message.get("content")
+        text = content if isinstance(content, str) else ""
+        stable_char_count += len(text)
+        stable_hasher.update(role.encode("utf-8", "replace"))
+        stable_hasher.update(b"\0")
+        stable_hasher.update(str(len(text)).encode("ascii"))
+        stable_hasher.update(b"\0")
+        for tool_call in message.get("tool_calls") or []:
+            if not isinstance(tool_call, dict):
+                continue
+            stable_hasher.update(str(tool_call.get("id") or "").encode("utf-8", "replace"))
+            stable_hasher.update(b"\0")
+
+    tail_char_count = sum(
+        len(str(message.get("content") or ""))
+        for message in messages[tail_start:]
+    )
+    tools_diag = _tools_diagnostics(tools, tools_diag_cache)
+    return {
+        "kv_loop": int(loop),
+        "kv_message_count": len(roles),
+        "kv_roles_hash": _short_hash("|".join(roles)),
+        "kv_system_count": role_counts.get("system", 0),
+        "kv_assistant_count": role_counts.get("assistant", 0),
+        "kv_tool_count": role_counts.get("tool", 0),
+        "kv_user_count": role_counts.get("user", 0),
+        "kv_content_char_count": content_char_count,
+        # 近似值：不拼整段 JSON，只按内容 + 每消息固定包装开销估算。
+        "kv_serialized_char_count": content_char_count + 64 * len(roles),
+        "kv_system_char_count": role_chars.get("system", 0),
+        "kv_user_char_count": role_chars.get("user", 0),
+        "kv_assistant_char_count": role_chars.get("assistant", 0),
+        "kv_tool_char_count": role_chars.get("tool", 0),
+        "kv_tools_count": len(tools or []),
+        "kv_tools_hash": tools_diag["hash"],
+        "kv_tools_char_count": tools_diag["chars"],
+        "kv_tools_full_count": tools_diag["full"],
+        "kv_tools_stub_count": tools_diag["stub"],
+        "kv_prefix_stable_hash": stable_hasher.hexdigest()[:12],
+        "kv_prefix_stable_char_count": stable_char_count,
+        "kv_tail_block_count": len(messages) - tail_start,
+        "kv_tail_char_count": tail_char_count,
+        "kv_has_send_receipt": block_counts["send_receipt"] > 0,
+        "kv_send_receipt_block_count": block_counts["send_receipt"],
+        "kv_send_receipt_char_count": block_chars["send_receipt"],
+        "kv_task_context_block_count": block_counts["task_context"],
+        "kv_task_context_char_count": block_chars["task_context"],
+        "kv_has_recent_group_messages": has_recent_group,
+        "kv_recent_group_message_line_count": recent_group_lines,
+        "kv_has_rag": block_counts["rag"] > 0,
+        "kv_rag_block_count": block_counts["rag"],
+        "kv_rag_char_count": block_chars["rag"],
+    }
+
+
+def _tools_diagnostics(
+    tools: list[dict[str, Any]] | None,
+    cache: dict[int, tuple[int, dict[str, Any]]] | None,
+) -> dict[str, Any]:
+    if not tools:
+        return {"hash": "", "chars": 0, "full": 0, "stub": 0}
+    key = id(tools)
+    if cache is not None:
+        cached = cache.get(key)
+        if cached is not None and cached[0] == len(tools):
+            return cached[1]
+    full = 0
+    stub = 0
+    for tool in tools:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        parameters = function.get("parameters") if isinstance(function, dict) else None
+        properties = parameters.get("properties") if isinstance(parameters, dict) else None
+        if isinstance(properties, dict) and "_tool_search_required" in properties:
+            stub += 1
+        else:
+            full += 1
+    tools_text = json.dumps(
+        tools,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    result = {
+        "hash": _short_hash(tools_text),
+        "chars": len(tools_text),
+        "full": full,
+        "stub": stub,
+    }
+    if cache is not None:
+        cache[key] = (len(tools), result)
+        if len(cache) > 8:
+            for stale_key in list(cache)[:-8]:
+                cache.pop(stale_key, None)
+    return result
+
+
+def _kv_prompt_diagnostics_full(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    *,
+    loop: int,
+    model: str = "",
+) -> dict[str, Any]:
+    """旧的全量诊断；仅在 kv_prompt_diagnostics=full 时使用。"""
     normalized = normalize_messages(messages)
     serialized = json.dumps(
         normalized,
@@ -1002,7 +1303,15 @@ def _kv_prompt_diagnostics(
         default=str,
     )
     tool_schema_modes = _tool_schema_mode_counts(tools or [])
-    diag: dict[str, Any] = {
+    tail_start = first_tail_block_index(normalized)
+    stable_text = json.dumps(
+        normalized[:tail_start],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return {
         "kv_loop": int(loop),
         "kv_message_count": len(normalized),
         "kv_roles_hash": _short_hash("|".join(roles)),
@@ -1024,6 +1333,12 @@ def _kv_prompt_diagnostics(
         "kv_prefix_8k_hash": _short_hash(serialized[:8192]),
         "kv_prefix_16k_hash": _short_hash(serialized[:16384]),
         "kv_prefix_24k_hash": _short_hash(serialized[:24576]),
+        "kv_prefix_32k_hash": _short_hash(serialized[:32768]),
+        "kv_prefix_48k_hash": _short_hash(serialized[:49152]),
+        "kv_prefix_stable_hash": _short_hash(stable_text),
+        "kv_prefix_stable_char_count": len(stable_text),
+        "kv_tail_block_count": len(normalized) - tail_start,
+        "kv_tail_char_count": len(serialized) - len(stable_text),
         "kv_has_send_receipt": "<send_receipt" in joined_content,
         "kv_send_receipt_block_count": joined_content.count("<send_receipt"),
         "kv_send_receipt_char_count": _tagged_block_char_count(
@@ -1044,7 +1359,6 @@ def _kv_prompt_diagnostics(
             "retrieved_conversation_context",
         ),
     }
-    return diag
 
 
 def _short_hash(text: str) -> str:

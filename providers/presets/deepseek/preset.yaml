@@ -6,7 +6,7 @@ registration_url: https://platform.deepseek.com
 reasoning_style: thinking_extra_body
 
 models:
-  - id: deepseek-v4-flash
+  - id: deepseek-flash
     display_name: DeepSeek V4 Flash（推荐 · 1M 上下文）
     capabilities: [chat, tool_call, reasoning]
     context_length: 1000000

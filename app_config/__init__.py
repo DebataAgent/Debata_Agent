@@ -22,6 +22,7 @@ from .loader import (
     load_config,
     save_config,
     set_active_config,
+    user_error_text,
 )
 from .paths import AppPaths
 from .schema import (
@@ -104,6 +105,7 @@ __all__ = [
     "get_config",
     "set_active_config",
     "ConfigError",
+    "user_error_text",
     # secrets
     "SecretsManager",
     "SecretsError",

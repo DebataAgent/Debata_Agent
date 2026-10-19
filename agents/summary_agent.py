@@ -59,11 +59,11 @@ class SummaryAgent:
             return None
 
         history_text = "\n".join(_format_history_line(m) for m in history_slice)
+        # 顺序 = 变化频率升序：静态规范最前（跨次压缩逐字节相同，可命中前缀缓存），
+        # 其次低频的现存重要记忆，最后才是每次必然不同的滚动摘要与待归档对话。
+        # 旧顺序把静态规范夹在易变数据之后，任何变化都会从头作废整段 prompt。
         prompt = (
             "你是当前角色的记忆管理系统。请把一段旧对话历史并入全局滚动摘要。\n\n"
-            f"<现有滚动摘要>\n{existing_summary_text or '（无）'}\n</现有滚动摘要>\n\n"
-            f"<现存重要记忆>\n{existing_important_text or '（无）'}\n</现存重要记忆>\n\n"
-            f"<待归档对话>\n{history_text}\n</待归档对话>\n\n"
             "<任务>\n"
             "1. 输出合并后的滚动摘要，保留人物关系、长期约定、未完成事项、关键决定和跨会话背景。\n"
             "2. 不要逐条流水复述，不要保留一次性工具执行细节。\n"
@@ -85,7 +85,10 @@ class SummaryAgent:
             "```json\n"
             '{"summary_text": "合并后的滚动摘要", '
             '"new_important": [{"content": "一句话描述", "scope": "user:123456", "pinned": false}, ...]}\n'
-            "```"
+            "```\n\n"
+            f"<现存重要记忆>\n{existing_important_text or '（无）'}\n</现存重要记忆>\n\n"
+            f"<现有滚动摘要>\n{existing_summary_text or '（无）'}\n</现有滚动摘要>\n\n"
+            f"<待归档对话>\n{history_text}\n</待归档对话>"
         )
 
         try:
@@ -144,10 +147,10 @@ class SummaryAgent:
         range_start = self.summarize_cfg.range_start_messages
         range_end = self.summarize_cfg.range_end_messages
 
+        # 同上：静态规范在前（可缓存），易变数据在后。
+        # 注意「前 N 条」这句话含 len(history_slice)，属易变内容，已挪到数据区。
         prompt = (
-            f"你是当前角色的记忆管理系统。以下是该角色的前 {len(history_slice)} 条对话历史。\n\n"
-            f"<现存重要记忆>\n{existing_important_text or '（无）'}\n</现存重要记忆>\n\n"
-            f"<对话历史>\n{history_text}\n</对话历史>\n\n"
+            "你是当前角色的记忆管理系统。\n\n"
             f"<任务>\n"
             f"1. 从对话历史中提取新增的重要信息（人名、关系、约定、秘密、偏好等），"
             f"不要存日常闲聊。\n"
@@ -160,7 +163,10 @@ class SummaryAgent:
             f'{{"cut_point": <数字>, "new_important": '
             f'[{{"timestamp": "时间", "content": "一句话描述"}}, ...]}}\n'
             f"```\n\n"
-            f"注意：cut_point 必须在 {range_start}~{range_end} 之间。"
+            f"注意：cut_point 必须在 {range_start}~{range_end} 之间。\n\n"
+            f"以下是该角色的前 {len(history_slice)} 条对话历史。\n\n"
+            f"<现存重要记忆>\n{existing_important_text or '（无）'}\n</现存重要记忆>\n\n"
+            f"<对话历史>\n{history_text}\n</对话历史>"
         )
 
         try:

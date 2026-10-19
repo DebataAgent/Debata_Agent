@@ -28,6 +28,7 @@ config.yaml
 # === 运行时数据（用户私有，绝不上传）===
 data/
 !data/.gitkeep
+.debata-run/
 
 # === 用户人格（个人私设，不上传）===
 # 所有人格平级放 personas/ 下。仓库自带的（debata）入 git，其余排除。

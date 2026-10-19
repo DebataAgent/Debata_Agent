@@ -38,8 +38,10 @@ from providers.base import (
     ReasoningConfig,
     ToolCall,
     Usage,
+    headers_with_neutral_user_agent,
     normalize_messages,
 )
+from utils.proxy_env import sanitize_no_proxy_env
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +78,16 @@ class OpenAICompatProvider(IProvider):
             'thinking_extra_body'  —— DeepSeek/GLM 风格：extra_body={"thinking": {"type": ...}}
             'openai_native'        —— 不传（OpenAI o1/o3 隐式启用）
             'qwen_enable_thinking' —— 通义千问：extra_body={"enable_thinking": True}
+            'none'                 —— 不传，且明确表示"这是不认识的中转站，别猜"
+
+        注意默认值是 thinking_extra_body（DeepSeek 系）。自定义 provider 若不希望
+        发送厂商私有字段，必须显式传 'none'——providers/registry.py 已代为处理。
         """
+
+        # AsyncOpenAI 一构造就把 NO_PROXY 展开成代理挂载表，条目里带方括号的 IPv6
+        # （[::1]）会拼出非法 pattern 直接抛 InvalidURL。这里兜住「直接 new 一个
+        # provider」的路径（pytest、内嵌用法、健康探针），不必依赖调用方先清理。
+        sanitize_no_proxy_env()
 
         # openai SDK 拒绝空 api_key；未配置时传占位符，调用时由 API 返回 401 触发明确错误
         sdk_api_key = self.api_key or "NO_API_KEY_CONFIGURED"
@@ -84,7 +95,7 @@ class OpenAICompatProvider(IProvider):
             api_key=sdk_api_key,
             base_url=self.base_url,
             timeout=httpx.Timeout(self.timeout, connect=10.0),
-            default_headers=self.extra_headers or None,
+            default_headers=headers_with_neutral_user_agent(self.extra_headers),
         )
 
     async def aclose(self) -> None:
@@ -153,6 +164,10 @@ class OpenAICompatProvider(IProvider):
             raise ProviderTimeoutError(f"{self.name}: 超时: {e}") from e
         except APIError as e:
             raise ProviderError(f"{self.name}: API 错误: {e}") from e
+        except TypeError as e:
+            # 同 anthropic_proto：SDK 调用签名写错时给出明确原因，
+            # 别让它冒到上层变成含糊的「未知错误」。
+            raise ProviderError(f"{self.name}: 内部错误（请求未发出）: {e}") from e
 
     # ============================================================
     # 内部：流式 / 非流式

@@ -47,6 +47,7 @@
       emoji/
       models/
       workspace/
+      providers/presets/   # 用户自定义提供商预设（同名 id 覆盖内置）
 ```
 
 `DATA_DIR` 指向当前实例目录；旧兼容模式下仍指向 `project_root/data`。

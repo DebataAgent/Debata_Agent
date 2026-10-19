@@ -13,6 +13,11 @@ dependencies = [
     "httpx>=0.27.0",          # 异步 HTTP（替代 requests）
     "aiofiles>=23.2.0",       # 异步文件 I/O
 
+    # === WebUI（默认界面，取代原 PySide6 桌面端）===
+    "fastapi>=0.110.0",       # HTTP + WebSocket 路由
+    "uvicorn[standard]>=0.27.0",  # ASGI 服务器
+    "python-multipart>=0.0.9",    # 表单 / 文件上传
+
     # === LLM 提供商 SDK（按需懒加载）===
     "openai>=1.50.0",         # OpenAI 协议（DeepSeek/GLM/Moonshot/Qwen 等都用此）
     "anthropic>=0.40.0",      # Anthropic Claude
@@ -35,8 +40,6 @@ dependencies = [
     "platformdirs>=4.2.0",    # 跨平台用户数据目录
     "python-dotenv>=1.0.0",   # 旧 .env 迁移时使用
     "pypdf>=4.0.0",           # workspace 内 PDF 文件文本抽取
-
-    # GUI 依赖放在 optional-dependencies.gui，服务器/无头部署可不安装 Qt。
 ]
 
 [project.optional-dependencies]
@@ -63,11 +66,6 @@ local-models = [
     "sentence-transformers>=2.7.0",
 ]
 
-# GUI（Phase 2）
-gui = [
-    "PySide6>=6.7.0",
-    "qasync>=0.27.0",  # PySide6 + asyncio 桥接
-]
 
 # 开发依赖
 dev = [
@@ -84,6 +82,11 @@ debata = "main:main"
 requires = ["setuptools>=65", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools]
+# 顶层脚本模块：main.py / main_cli.py 不是包，必须显式声明，
+# 否则 [project.scripts] 的 debata 入口装上后会 ModuleNotFoundError。
+py-modules = ["main", "main_cli", "webui_server", "service_cli"]
+
 [tool.setuptools.packages.find]
 include = [
     "adapters*",
@@ -96,8 +99,8 @@ include = [
     "plugins*",
     "providers*",
     "tools*",
-    "ui*",
     "utils*",
+    "webui*",
 ]
 exclude = [
     "data*",
@@ -112,12 +115,22 @@ providers = [
     "presets/*/tutorial/*.md",
     "presets/*/tutorial/.gitkeep",
     "presets/*/icon.png",
+    # 能力矩阵：providers/model_capabilities.py 运行时读取，漏打包会让装后的
+    # wheel 在「获取模型列表」时 FileNotFound。
+    "model_capabilities.yaml",
 ]
 plugins = [
     "PLUGIN_SPEC.md",
     "voxcpm2/*.py",
     "embedding_bge_zh/*.py",
     "embedding_minilm/*.py",
+]
+webui = [
+    "static/*.html",
+    "static/*.css",
+    "static/*.svg",
+    "static/js/*.js",
+    "static/js/**/*.js",
 ]
 
 [tool.ruff]

@@ -14,7 +14,7 @@ Debata 不是 ChatGPT 套壳，也不是「能多就多」的 AI 全家桶。她
 - 真人聊天形态（拆条、不告别、风格随关系切换、允许跑题/改口/忘事）
 - KV 缓存友好的单一 system + XML 分区
 - 加密密钥不要密码（AES-GCM + RSA + keyring，密码学保证强度）
-- 用户配置全 GUI 可改（除 persona 文件本身）
+- 用户配置全 WebUI 可改（除 persona 文件本身）
 
 **不接受的 PR：**
 - 把 Debata 改成「全平台多账号 SaaS」
@@ -41,7 +41,7 @@ Debata 不是 ChatGPT 套壳，也不是「能多就多」的 AI 全家桶。她
    - 改了行为：补回归测试
    - 加了新功能：先写用例测试，再实现到通过
    - 不要直接 commit 到 `main`
-4. **安装测试依赖并跑全部测试**：`pip install -e ".[dev,gui]"` 后执行 `venv/Scripts/python -m pytest tests/ -q --ignore=tests/test_kv_cache_real.py`，确保全过。
+4. **安装测试依赖并跑全部测试**：`uv sync --extra dev` 后执行 `uv run python -m pytest tests/ -q --ignore=tests/test_kv_cache_real.py`，确保全过（与 CI 的 `.github/workflows/test.yml` 一致）。
 5. **提 PR 到 `develop` 分支**。
    - PR 标题：动词开头，一句话讲明白做了什么（如「fix: 修白名单 verify 模式漏判群消息」）
    - PR 描述写：动机 + 变更点 + 自测清单
@@ -58,8 +58,8 @@ Debata 不是 ChatGPT 套壳，也不是「能多就多」的 AI 全家桶。她
 项目用 [`ruff`](https://docs.astral.sh/ruff/) 做 lint 与格式化。`pyproject.toml` 里有 `[tool.ruff]` 配置。
 本地跑：
 ```bash
-venv/Scripts/python -m ruff check .
-venv/Scripts/python -m ruff format .
+uv run ruff check .
+uv run ruff format .
 ```
 
 **约定（在 ruff 之外）：**
@@ -93,14 +93,19 @@ venv/Scripts/python -m ruff format .
        capabilities: [chat, tool_call]
        context_length: 131072
    ```
-   `reasoning_style` 可选值：`none`（无思考）、`thinking_extra_body`（DeepSeek 风格）、`thinking_extra_header`（Anthropic 风格）。
+   `reasoning_style` 可选值：`none`（什么都不发，不认识的中转站用这个）、`thinking_extra_body`（DeepSeek / GLM / MiMo 风格）、`qwen_enable_thinking`（通义千问）、`openai_native`（OpenAI o 系列）。
+   注意 `pricing` 字段当前**不被解析**，写进去不会有任何效果。
 
 2. **写 `providers/presets/{name}/tutorial/get_api_key.md`**。3~5 段简短中文教程，覆盖：官网注册地址 → 如何获取 API Key → 计费说明 → 填到 Debata 的步骤。
 
-3. **验证**：启动 Debata → 向导或设置页 Model 节，下拉菜单应能看到新 provider。或用脚本：
+3. **验证**：启动 Debata → 向导的预设下拉、设置 →「模型」→「添加提供商」的预设下拉都应能看到新 provider。或用脚本：
    ```bash
-   venv/Scripts/python -c "from providers.presets_loader import load_all_presets; from app_config import AppPaths; from pathlib import Path; print(load_all_presets(AppPaths(project_root=Path('.')).PROVIDER_PRESETS_DIR).keys())"
+   uv run python -c "from providers.presets_loader import load_presets_for; from app_config import AppPaths; print(sorted(load_presets_for(AppPaths()).keys()))"
    ```
+
+> 只是想自己加一个 provider（比如中转站）的话，**不必改仓库**：
+> 放进数据目录的 `providers/presets/<name>/preset.yaml` 即可，同名 id 会覆盖内置预设；
+> 或者干脆在设置 →「模型」里点「添加提供商」填 Base URL。
 
 ---
 

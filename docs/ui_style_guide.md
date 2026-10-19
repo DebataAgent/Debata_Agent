@@ -3,7 +3,8 @@
 > 「砚台旁有墨，纸上有空」
 
 本文档定义 Debata_Agent 全部图形界面的视觉语言、文案口吻、交互节奏。
-所有 PySide6 组件都应遵循本指南。**新增界面前必读。**
+配色与组件规范同时适用于 WebUI（`webui/theme.py` + `webui/static/app.css`）。
+**新增界面前必读。**
 
 ---
 
@@ -106,7 +107,7 @@
 等宽：JetBrains Mono > Consolas
 ```
 
-### 字号阶梯（PySide6 用 px，1pt ≈ 1.33px）
+### 字号阶梯（px；Qt 端 1pt ≈ 1.33px）
 
 ```
 T1  装饰大标题       28px / 思源宋体 / weight 500 / line 1.4

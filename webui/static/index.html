@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>Debata_Agent 控制台</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <!-- 登录遮罩：需要令牌时先挡住整个界面 -->
+  <div id="login-gate" class="gate hidden">
+    <form class="gate-card" id="login-form">
+      <div class="gate-brand">Debata_Agent</div>
+      <p class="gate-hint">
+        WebUI 能查看全部聊天记录并修改配置，因此需要访问令牌。<br>
+        令牌在启动 Debata 的终端里打印，也保存在数据目录的
+        <code>webui_token.txt</code>。
+      </p>
+      <input type="password" id="login-token" placeholder="访问令牌" autocomplete="current-password"
+             spellcheck="false" required>
+      <div class="gate-error" id="login-error" role="alert"></div>
+      <button type="submit" class="btn btn-primary btn-block">进入</button>
+    </form>
+  </div>
+
+  <!-- 首次配置向导 -->
+  <div id="setup-gate" class="gate hidden">
+    <div class="gate-card gate-card-wide">
+      <div class="gate-brand">首次配置</div>
+      <div id="setup-body"></div>
+    </div>
+  </div>
+
+  <div id="shell" class="shell hidden">
+    <aside class="sidebar">
+      <div class="brand">Debata_Agent</div>
+      <nav class="nav" id="nav"></nav>
+      <div class="sidebar-foot">
+        <div class="conn" id="side-conn">
+          <span class="dot" id="side-dot"></span>
+          <span id="side-conn-text">连接中…</span>
+        </div>
+      </div>
+    </aside>
+
+    <div class="main">
+      <header class="topbar">
+        <div class="topbar-left">
+          <span class="badge" id="adapter-badge">渠道未连接</span>
+          <span class="persona-label" id="persona-label">当前角色：—</span>
+        </div>
+        <!-- 图标由 app.js 用 icons.js 挂载（线性 SVG，不用 emoji 字符） -->
+        <div class="topbar-right">
+          <button class="icon-btn" id="btn-restart" title="重启 Runtime"></button>
+          <button class="icon-btn" id="btn-theme" title="切换主题"></button>
+          <button class="icon-btn" id="btn-logout" title="退出登录"></button>
+        </div>
+      </header>
+
+      <main class="content" id="content"></main>
+    </div>
+  </div>
+
+  <div id="toast-host" class="toast-host" aria-live="polite"></div>
+
+  <script type="module" src="/static/js/app.js"></script>
+</body>
+</html>

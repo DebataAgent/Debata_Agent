@@ -6,7 +6,9 @@ Debata 的聊天风格来自 30 多段真实微信记录.它会把一段话拆�
 
 ### 2. 表情包
 
-把你的表情包放进 `data/emoji/` 目录, AI 会按对话情绪自动选图发送.文件名就是 AI 看到的名字, 建议起容易懂的（比如「笑哭」而不是 `emoji_0142`）.设置页提供拖放添加、缩略图预览、重命名和删除.
+把你的表情包放进 `data/emoji/` 目录, AI 会按对话情绪自动选图发送.文件名就是 AI 看到的名字, 建议起容易懂的（比如「笑哭」而不是 `emoji_0142`）.
+
+WebUI 侧栏的**「表情包」页**提供拖放 / 多选上传、上传前逐个改名、缩略图预览、重命名和删除。重名会自动加 `_1` 后缀并在上传后提示, 免得你找不到刚传的图.支持 png / jpg / jpeg / gif（与 AI 实际能发送的格式一致, 上限 5MB）.
 
 ### 3. 长期记忆
 
@@ -32,14 +34,34 @@ Debata 会记住你在对话中告诉它的事：承诺、约定、偏好、身�
 - **历史总结**：定期把老对话压成摘要存进长期记忆
 - **人格管理**：维护年龄档位、日常状态、用户关系和短期线索, 向聊天提供结构化上下文
 
-### 6. 兼容 13 家 LLM 提供商
+### 6. 兼容 14 家 LLM 提供商, 也可以接任意中转站
 
-OpenAI / Anthropic Claude / DeepSeek / 智谱 GLM / 通义千问 / 火山方舟 / Gemini / Moonshot / 硅基流动 / OpenRouter / Groq / Together / xAI.新增 provider 只需写一个 preset.yaml, 无需写代码.
+OpenAI / Anthropic Claude / DeepSeek / 智谱 GLM / 通义千问 / 火山方舟 / Gemini / Moonshot / 硅基流动 / OpenRouter / Groq / Together / xAI / 小米 MiMo.
+
+两条路加新模型：
+
+- **内置预设**：写一个 `preset.yaml` 即可, 无需写代码.
+- **自助添加**：设置 →「模型」→「添加提供商」.中转站选「自定义 OpenAI / Anthropic 兼容端点」再填 Base URL 就行, 支持「测试连接」和「获取模型列表」, 也可以把自定义预设放进数据目录的 `providers/presets/`.
+
+每个 provider 可以单独指定**思考参数风格**（`thinking_extra_body` / `qwen_enable_thinking` / `openai_native` / `none`）.接不认识的中转站时选 `none`, 就不会把厂商私有字段发过去被网关拒绝.
 
 ### 7. 安全
 
 API 密钥用 AES-256-GCM + RSA-2048 加密, 存系统 keyring, 不需要记密码.配置文件即时保存, 大部分改动不需要重启.
 
-### 8. GUI
+### 8. WebUI
 
-无边框圆角窗口, 深浅主题.图形化配置向导（推荐路径 7 步、自定义最多 9 步）, 7 页仪表盘, 设置页实时保存.托盘常驻, 左键打开仪表盘, 右键菜单.
+浏览器控制台, 深浅主题, 局域网内任何设备（手机 / 平板 / 另一台电脑）都能打开.
+
+首次配置向导 + 9 个页面: 总览 / 对话 / 记忆 / 人格后台 / 日志 / 角色 / 模型管理 / 黑名单 / 设置.
+设置页实时保存; 日志页实时跟随; 对话页带「模拟入站消息」输入框, 不接 QQ 也能先试跑人格.
+
+默认带令牌鉴权（启动时打印, 也可 `--token` 固定）, 详见 [WebUI 说明](webui.md).
+
+### 9. Token 效率与后台运行（2026-10）
+
+- **模型视图**：只裁剪发给模型的旧 `task_context`、发送回执和 `no_action` 配对；历史、归档、事件库原样保留。
+- **工具 schema 分级**：高频工具直出核心字段，低频/高风险工具按需 `tool_search detail=full`，固定 schema 开销约减半。
+- **发送成功自动收尾**：不再为收尾额外跑一次 `no_action` 模型调用。
+- **Token 计量**：规范 JSON 估算 messages + tools，按 provider/model 持久化校准，设置页可看估算误差和未命中输入。
+- **后台运行**：`debata start` / `debata stop` / `debata log` / `debata enable` / `debata disable` 短命令，底层是 systemd 用户服务；也支持 tmux、screen、nohup。完整排错文档见 [后台运行指南](background_running.md)。

@@ -52,7 +52,11 @@ async def test_probe_openai_compat_success(monkeypatch):
     )
 
     assert result.status == "ok"
-    assert clients[-1]["proxy"] == "http://127.0.0.1:7897"
+    # 环境代理仍然生效，但走 trust_env 而不是显式 proxy=。
+    # 显式传 proxy 会盖掉 httpx 自己的 NO_PROXY 判定，用户设了
+    # NO_PROXY=api.example.com 也照样被塞进代理（见下面那条测试）。
+    assert "proxy" not in clients[-1]
+    assert clients[-1]["trust_env"] is True
 
 
 @pytest.mark.asyncio
@@ -84,6 +88,48 @@ async def test_probe_endpoint_omits_proxy_when_env_is_empty(monkeypatch):
 
     assert result.status == "ok"
     assert "proxy" not in clients[-1]
+
+
+@pytest.mark.asyncio
+async def test_probe_endpoint_does_not_override_no_proxy(monkeypatch):
+    """设了 NO_PROXY 就必须真的绕开代理，不能被探针又塞回 proxy=。
+
+    回归背景：本机 HTTP(S)_PROXY 指向一个坏代理（TLS 握手 5 秒超时），
+    用户把中转站域名加进 NO_PROXY 想绕开，健康探针却照旧超时 —— 因为
+    ``_client_kwargs`` 显式传了 ``proxy=``，把 httpx 的绕过判定盖掉了。
+    表现是首页一直误报「不可用」，而真实模型调用（走 SDK 的 trust_env）是好的。
+
+    A/B 实测（10 次直连 api.bingyun.vip/v1/models）：
+        代理生效且未绕过 -> 0/10 成功（全 ConnectError）
+        加进 NO_PROXY     -> 10/10 到达服务器
+    """
+    clients = []
+
+    async def fake_post(self, url, headers=None, json=None):
+        return _DummyResponse(200, {"choices": [{"message": {"content": "x"}}]})
+
+    original_init = httpx.AsyncClient.__init__
+
+    def fake_init(self, *args, **kwargs):
+        clients.append(kwargs)
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
+    monkeypatch.setenv("NO_PROXY", "localhost,127.0.0.1,api.test")
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", fake_init)
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    result = await probe_provider_endpoint(
+        protocol="openai_compat",
+        base_url="https://api.test/v1",
+        api_key="sk",
+        model="m",
+    )
+
+    assert result.status == "ok"
+    assert "proxy" not in clients[-1], (
+        "显式传 proxy 会让 NO_PROXY 失效；必须交给 trust_env 处理"
+    )
 
 
 class _FakeProvider:

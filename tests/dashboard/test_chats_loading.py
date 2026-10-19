@@ -10,23 +10,23 @@ from types import SimpleNamespace
 import pytest
 
 from core.chat_timeline import ChatTimelineStore
-from ui.dashboard.chats_page import _load_chat_page_records
+from webui.chatlog.records import _load_chat_page_records
 
-from tests.test_dashboard_p2 import (
-    _FailingRecordStore,
-    _FakeEventStore,
-    _PagedArchiveStore,
-    _StaticRecordStore,
-    _dashboard_runtime,
-    _qq_event,
-    _timeline_record,
+from tests.dashboard.helpers import (
+    FailingRecordStore,
+    FakeEventStore,
+    PagedArchiveStore,
+    StaticRecordStore,
+    dashboard_runtime,
+    qq_event,
+    timeline_record,
 )
 
 @pytest.mark.asyncio
 async def test_chats_loads_archive_before_active_history(tmp_paths):
-    rt = _dashboard_runtime(tmp_paths)
-    rt.archive = _StaticRecordStore([{"role": "user", "content": "归档旧消息"}])
-    rt.history = _StaticRecordStore([{"role": "assistant", "content": "活跃新消息"}])
+    rt = dashboard_runtime(tmp_paths)
+    rt.archive = StaticRecordStore([{"role": "user", "content": "归档旧消息"}])
+    rt.history = StaticRecordStore([{"role": "assistant", "content": "活跃新消息"}])
 
     records = await _load_chat_page_records(rt)
 
@@ -46,9 +46,9 @@ async def test_chats_loads_archive_through_filter_records_pages(tmp_paths):
         }
         for i in range(3)
     ]
-    rt = _dashboard_runtime(tmp_paths)
-    rt.archive = _PagedArchiveStore(archived, page_size=2)
-    rt.history = _StaticRecordStore([{"role": "assistant", "content": "活跃新消息"}])
+    rt = dashboard_runtime(tmp_paths)
+    rt.archive = PagedArchiveStore(archived, page_size=2)
+    rt.history = StaticRecordStore([{"role": "assistant", "content": "活跃新消息"}])
 
     records = await _load_chat_page_records(rt)
 
@@ -64,8 +64,8 @@ async def test_chats_loads_archive_through_filter_records_pages(tmp_paths):
 
 @pytest.mark.asyncio
 async def test_chats_load_debug_metrics_do_not_log_message_body(tmp_paths, caplog):
-    rt = _dashboard_runtime(tmp_paths)
-    rt.history = _StaticRecordStore(
+    rt = dashboard_runtime(tmp_paths)
+    rt.history = StaticRecordStore(
         [
             {
                 "role": "system",
@@ -74,9 +74,9 @@ async def test_chats_load_debug_metrics_do_not_log_message_body(tmp_paths, caplo
             }
         ]
     )
-    rt.event_store = _FakeEventStore(
+    rt.event_store = FakeEventStore(
         [
-            _qq_event(
+            qq_event(
                 1,
                 "qq_message_received",
                 conversation_id="private:debug",
@@ -87,7 +87,7 @@ async def test_chats_load_debug_metrics_do_not_log_message_body(tmp_paths, caplo
     )
     timeline = ChatTimelineStore()
     timeline.append(
-        _timeline_record(
+        timeline_record(
             conversation_id="private:debug",
             direction="outbound",
             text="timeline-secret-body",
@@ -99,7 +99,7 @@ async def test_chats_load_debug_metrics_do_not_log_message_body(tmp_paths, caplo
         )
     )
     rt.pipeline = SimpleNamespace(chat_timeline=timeline)
-    rt.archive = _PagedArchiveStore(
+    rt.archive = PagedArchiveStore(
         [
             {
                 "archive_id": "archive-debug",
@@ -114,7 +114,7 @@ async def test_chats_load_debug_metrics_do_not_log_message_body(tmp_paths, caplo
         page_size=1,
     )
 
-    with caplog.at_level(logging.DEBUG, logger="ui.dashboard.chats_page"):
+    with caplog.at_level(logging.DEBUG, logger="webui.chatlog.records"):
         records = await _load_chat_page_records(rt)
 
     assert len(records) == 4
@@ -137,10 +137,10 @@ async def test_chats_load_debug_metrics_do_not_log_message_body(tmp_paths, caplo
 
 @pytest.mark.asyncio
 async def test_chats_loads_timeline_without_archive(tmp_paths):
-    rt = _dashboard_runtime(tmp_paths)
+    rt = dashboard_runtime(tmp_paths)
     timeline = ChatTimelineStore()
     timeline.append(
-        _timeline_record(
+        timeline_record(
             conversation_id="private:10001",
             direction="outbound",
             text="实时发出",
@@ -152,7 +152,7 @@ async def test_chats_loads_timeline_without_archive(tmp_paths):
         )
     )
     rt.pipeline = SimpleNamespace(chat_timeline=timeline)
-    rt.history = _StaticRecordStore([])
+    rt.history = StaticRecordStore([])
 
     records = await _load_chat_page_records(rt)
 
@@ -161,9 +161,9 @@ async def test_chats_loads_timeline_without_archive(tmp_paths):
 
 @pytest.mark.asyncio
 async def test_chats_falls_back_to_history_when_archive_fails(tmp_paths):
-    rt = _dashboard_runtime(tmp_paths)
-    rt.archive = _FailingRecordStore()
-    rt.history = _StaticRecordStore([{"role": "system", "content": "活跃系统事件"}])
+    rt = dashboard_runtime(tmp_paths)
+    rt.archive = FailingRecordStore()
+    rt.history = StaticRecordStore([{"role": "system", "content": "活跃系统事件"}])
 
     records = await _load_chat_page_records(rt)
 

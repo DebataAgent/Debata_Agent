@@ -409,6 +409,7 @@ async def test_main_reply_budget_overflow_compacts_before_calling_model(build_pi
     agent = FakeSummaryAgent()
     pipeline.summary_agent = agent
     pipeline.behavior_cfg.context.max_context_tokens = 31_000
+    pipeline._fixed_prompt_overhead_cache = 0
     pipeline.behavior_cfg.context.reserve_output_tokens = 1_000
     summarize = pipeline.behavior_cfg.summarize
     summarize.trigger_at_tokens = 999_999
@@ -459,6 +460,7 @@ async def test_main_reply_budget_retry_expands_compaction_range(build_pipeline):
     summarize.trigger_at_tokens = 999_999
     summarize.target_after_tokens = 15_000
     summarize.retry_target_after_context_percent = 20
+    pipeline._fixed_prompt_overhead_cache = 0
     await _add_history_until_active_tokens(
         pipeline,
         history,
@@ -612,6 +614,7 @@ async def test_compaction_uses_percent_thresholds_when_token_fields_are_unset(
     agent = FakeSummaryAgent()
     pipeline.summary_agent = agent
     pipeline.behavior_cfg.context.max_context_tokens = 1_000
+    pipeline._fixed_prompt_overhead_cache = 0
     summarize = pipeline.behavior_cfg.summarize
     summarize.trigger_at_tokens = None
     summarize.target_after_tokens = None

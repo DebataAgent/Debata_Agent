@@ -62,6 +62,10 @@ class ChatAgent:
         pending_context_provider=None,
         max_loops: int | None = None,
         runtime_event_callback: RuntimeEventCallback | None = None,
+        estimated_prompt_tokens: int = 0,
+        calib_ratio: float = 1.0,
+        auto_finish_after_send: bool = False,
+        kv_diagnostics_mode: str = "summary",
     ) -> AgentRunResult:
         """执行一次完整对话循环（直到工具调用收尾）。
 
@@ -80,4 +84,8 @@ class ChatAgent:
             status_callback=self.status_callback,
             runtime_event_callback=runtime_event_callback or self.runtime_event_callback,
             status_label="主模型",
+            estimated_prompt_tokens=estimated_prompt_tokens,
+            calib_ratio=calib_ratio,
+            auto_finish_after_send=auto_finish_after_send,
+            kv_diagnostics_mode=kv_diagnostics_mode,
         )

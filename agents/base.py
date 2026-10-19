@@ -18,6 +18,7 @@ RuntimeEventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 FinishReason = Literal[
     "no_action",
     "finish_after_success",
+    "finish_after_send",
     "tool_stop",
     "no_tool_after_retry",
     "tool_loop_finalized",
@@ -46,7 +47,14 @@ class AgentRunResult:
     """每轮 reasoning_content 的拼接（用于 UI 展示思考过程）"""
 
     prompt_tokens: int = 0
-    """本轮所有模型调用累计的 prompt token，用于上下文估算校准。"""
+    """本轮所有模型调用累计的 prompt token（含工具循环的每一轮）。"""
+
+    first_prompt_tokens: int = 0
+    """本轮**第一次**模型调用的 prompt token；0 表示一次都没调成功。
+
+    上下文估算校准必须用它，不能用 `prompt_tokens` —— 后者是工具循环累加值，
+    与预检时的单次估算不是一个口径，拿它校准会把系数推向错误方向。
+    """
 
     def has_records(self) -> bool:
         return bool(self.records)

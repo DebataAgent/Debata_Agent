@@ -259,6 +259,14 @@ class PipelineTurnsMixin:
                     runtime_event_callback=self._runtime_event_callback(
                         record_conversation_id or conversation_id or "system:global"
                     ),
+                    estimated_prompt_tokens=budget_result.estimated_tokens,
+                    calib_ratio=self._token_calib_ratio,
+                    auto_finish_after_send=bool(
+                        getattr(self.behavior_cfg, "auto_finish_after_send", True)
+                    ),
+                    kv_diagnostics_mode=str(
+                        getattr(self.behavior_cfg, "kv_prompt_diagnostics", "summary")
+                    ),
                 )
             finally:
                 self._send_manager.end_model_turn(conversation_id)

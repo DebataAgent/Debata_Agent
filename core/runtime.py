@@ -255,7 +255,8 @@ class Runtime:
         from providers import ProviderRegistry
 
         self.provider_registry = ProviderRegistry()
-        self.provider_registry.load_presets(self.paths.PROVIDER_PRESETS_DIR)
+        # 内置预设 + 数据目录里的用户预设（同名覆盖）
+        self.provider_registry.load_presets_for(self.paths)
         self.provider_registry.build_from_config(self.config.providers, self.secrets)
         self.providers = {
             name: self.provider_registry.get(name)
@@ -431,7 +432,11 @@ class Runtime:
 
         # ----- 11. Pipeline -----
         from .message_pipeline import MessagePipeline
+        from .token_calibration import TokenCalibrationStore
 
+        self.token_calibration = TokenCalibrationStore(
+            self.paths.TOKEN_CALIBRATION_FILE
+        )
         chat_context_length = self._model_context_length(chat_cfg.provider, chat_cfg.model)
         pipeline_kwargs = {
             "adapter": self.adapter,
@@ -447,6 +452,7 @@ class Runtime:
             "behavior_cfg": self.config.behavior,
             "features_cfg": self.config.features,
             "whitelist": adapter_cfg.whitelist,
+            "blacklist": getattr(adapter_cfg, "blacklist", None),
             "emoji_dir": self.paths.EMOJI_DIR,
             "workspace_dir": self.paths.WORKSPACE_DIR,
             "rate_limiter": self.rate_limiter,
@@ -459,6 +465,7 @@ class Runtime:
             "tts": self.tts,
             "rag_memory": self.rag_memory,
             "event_store": self.event_store,
+            "token_calibration": self.token_calibration,
         }
         persona_pipeline_kwargs = {
             "persona_agent": self.persona_agent,

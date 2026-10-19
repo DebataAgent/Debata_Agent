@@ -1,0 +1,40 @@
+# Debata Agent —— systemd 系统级服务模板
+#
+# 适用于服务器/多用户环境，服务以专用用户运行。安装：
+#   sudo useradd --system --create-home --shell /usr/sbin/nologin debata
+#   sudo mkdir -p /opt/Debata_Agent
+#   sudo chown -R debata:debata /opt/Debata_Agent
+#   # 以 debata 用户完成部署和 uv sync 后：
+#   sudo cp scripts/systemd/debata-agent.system.service /etc/systemd/system/debata-agent.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now debata-agent
+#
+# 请按实际路径/用户修改 WorkingDirectory、ExecStart、User、Group。
+# 默认同时启动 WebUI 和 QQ Runtime；只跑 headless Runtime 时加 --no-gui。
+
+[Unit]
+Description=Debata Agent (WebUI + QQ runtime)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=debata
+Group=debata
+WorkingDirectory=/opt/Debata_Agent
+ExecStart=/opt/Debata_Agent/.venv/bin/python /opt/Debata_Agent/main.py --host 0.0.0.0 --port 8000
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/debata-agent.env
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=60
+KillSignal=SIGINT
+UMask=0077
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

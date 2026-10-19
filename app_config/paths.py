@@ -10,6 +10,7 @@
                 vector/{name}/      <- 各人格的 RAG 向量库
                 logs/               <- 结构化日志
                 emoji/              <- 表情包资源
+                providers/presets/  <- 用户自定义提供商预设（覆盖同名内置预设）
 
 开发兼容模式仍保留旧布局：
     项目根/
@@ -81,6 +82,7 @@ class AppPaths:
 
         self.MEMORY_DIR: Path = self.DATA_DIR / "memory"
         self.VECTOR_DIR: Path = self.DATA_DIR / "vector"
+        self.TOKEN_CALIBRATION_FILE: Path = self.DATA_DIR / "token_calibration.json"
         self.LOGS_DIR: Path = self.DATA_DIR / "logs"
         self.EMOJI_DIR: Path = self.DATA_DIR / "emoji"
         self.MODELS_DIR: Path = self.DATA_DIR / "models"
@@ -95,6 +97,11 @@ class AppPaths:
 
         # === 仓库内置资源（git 追踪） ===
         self.PROVIDER_PRESETS_DIR: Path = project_root / "providers" / "presets"
+
+        # === 用户自定义预设（数据目录，gitignore） ===
+        # 与内置预设合并，同名 id 以用户目录为准。用于接入内置列表里没有的厂商，
+        # 或覆盖内置预设的 base_url 走中转站——用户不该去改仓库里的 providers/presets/。
+        self.USER_PROVIDER_PRESETS_DIR: Path = self.DATA_DIR / "providers" / "presets"
 
     @classmethod
     def _resolve_data_root(
@@ -151,6 +158,7 @@ class AppPaths:
             self.EMOJI_DIR,
             self.MODELS_DIR,
             self.WORKSPACE_DIR,
+            self.USER_PROVIDER_PRESETS_DIR,
         ):
             d.mkdir(parents=True, exist_ok=True)
         # PERSONAS_DIR 在仓库根目录，必然存在（init 时已 ensure）

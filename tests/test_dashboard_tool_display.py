@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 
-import ui.dashboard.tool_display as tool_display
-from ui.dashboard.tool_display import format_tool_call, format_tool_result
+import webui.chatlog.tool_display as tool_display
+from webui.chatlog.tool_display import format_tool_call, format_tool_result
 
 
 def test_tool_display_formats_commit_send_attempt_call_readably():
